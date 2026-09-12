@@ -1,0 +1,4 @@
+# x86_64-pc-windows-gnu (MinGW) 下为 cdylib 自动导出全部符号会超出
+# PE 导出表上限，报 "export ordinal too large"，这里禁止自动导出。
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-arg=-Wl,--exclude-all-symbols"]
