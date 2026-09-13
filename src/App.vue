@@ -2,49 +2,96 @@
 import { ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 
-const greetMsg = ref("");
-const name = ref("");
+/** 与 Rust 侧 model::TsSentence 一一对应 */
+interface TsSentence {
+  source: string;
+  target: string;
+}
 
-async function greet() {
-  // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-  greetMsg.value = await invoke("greet", { name: name.value });
+const path = ref(
+  "D:\\myProgram\\game2\\lilisproject\\SUCCUBUS DESIRE ~リリスプロジェクト~\\TrsData.bin",
+);
+const entries = ref<TsSentence[]>([]);
+const error = ref("");
+
+async function load() {
+  error.value = "";
+  try {
+    entries.value = await invoke<TsSentence[]>("load_dictionary", {
+      path: path.value,
+    });
+  } catch (e: any) {
+    entries.value = [];
+    error.value = e?.message ?? String(e);
+  }
 }
 </script>
 
 <template>
   <main class="container">
-    <h1>Welcome to Tauri + Vue</h1>
+    <h1>wtool</h1>
 
-    <div class="row">
-      <a href="https://vite.dev" target="_blank">
-        <img src="/vite.svg" class="logo vite" alt="Vite logo" />
-      </a>
-      <a href="https://tauri.app" target="_blank">
-        <img src="/tauri.svg" class="logo tauri" alt="Tauri logo" />
-      </a>
-      <a href="https://vuejs.org/" target="_blank">
-        <img src="./assets/vue.svg" class="logo vue" alt="Vue logo" />
-      </a>
-    </div>
-    <p>Click on the Tauri, Vite, and Vue logos to learn more.</p>
-
-    <form class="row" @submit.prevent="greet">
-      <input id="greet-input" v-model="name" placeholder="Enter a name..." />
-      <button type="submit">Greet</button>
+    <form @submit.prevent="load">
+      <input v-model="path" />
+      <button type="submit">查询</button>
     </form>
-    <p>{{ greetMsg }}</p>
+
+    <p v-if="error"> {{ error }} </p>
+    <p v-else> 共 {{ entries.length }} 条 </p>
+
+    <table v-if="entries.length">
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>原文</th>
+          <th>译文</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr v-for="(value,index) in entries">
+          <td>{{ index+1 }}</td>
+          <td>{{ value.source }}</td>
+          <td>{{ value.target }}</td>
+        </tr>
+      </tbody>
+
+    </table>
+
   </main>
 </template>
 
 <style scoped>
-.logo.vite:hover {
-  filter: drop-shadow(0 0 2em #747bff);
+.container {
+  padding-top: 4vh;
 }
 
-.logo.vue:hover {
-  filter: drop-shadow(0 0 2em #249b73);
+table {
+  margin: 1em auto;
+  border-collapse: collapse;
+  font-size: 0.9em;
+  text-align: left;
 }
 
+th,
+td {
+  border: 1px solid #cccccc80;
+  padding: 0.3em 0.8em;
+  vertical-align: top;
+}
+
+th {
+  position: sticky;
+  top: 0;
+  background-color: inherit;
+}
+
+.source {
+  white-space: pre-wrap;
+}
+
+.error {
+  color: #d9534f;
+}
 </style>
 <style>
 :root {
@@ -133,7 +180,7 @@ button {
   outline: none;
 }
 
-#greet-input {
+#path-input {
   margin-right: 5px;
 }
 
