@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 /** 与 Rust 侧 model::TsSentence 一一对应 */
 interface TsSentence {
@@ -8,17 +9,133 @@ interface TsSentence {
   target: string;
 }
 
-const path = ref(
-  "D:\\myProgram\\game2\\lilisproject\\SUCCUBUS DESIRE ~リリスプロジェクト~\\TrsData.bin",
+/** 与 Rust 侧 engine::inject::MethodStatus 一一对应 */
+interface MethodStatus {
+  id: string;
+  name: string;
+  state: "not_applicable" | "ready" | "installed" | "stale";
+  detail: string;
+  reversible:
+    | "runtime_full"
+    | "runtime_and_offline"
+    | "offline_only"
+    | "none";
+  restart_required: boolean;
+}
+
+/** 状态/撤销程度的中文说法，只影响显示，逻辑判断还是用原值 */
+const STATE_TEXT: Record<MethodStatus["state"], string> = {
+  not_applicable: "不适用",
+  ready: "未安装",
+  installed: "已安装",
+  stale: "需重装",
+};
+const REVERSIBLE_TEXT: Record<MethodStatus["reversible"], string> = {
+  runtime_full: "断开即恢复",
+  runtime_and_offline: "断开并还原文件",
+  offline_only: "只能还原文件",
+  none: "只能重启游戏",
+};
+
+/** GUI 上填的变量，对应 Rust 侧 task::Config */
+const gameDir = ref(
+  "D:\\myProgram\\game2\\lilisproject\\SUCCUBUS DESIRE ~リリスプロジェクト~",
 );
+const dictPath = ref(`${gameDir.value}\\TrsData.bin`);
+
 const entries = ref<TsSentence[]>([]);
+const logs = ref<string[]>([]);
 const error = ref("");
+
+/** 这个游戏目录上支持的注入方式，以及各自现在什么状态 */
+const methods = ref<MethodStatus[]>([]);
+
+// Rust 那边 app.emit("trans-status", msg)，这里收
+listen<string>("trans-status", (e) => {
+  logs.value.push(e.payload);
+  if (logs.value.length > 200) logs.value.shift();
+});
+
+/** 重新探测注入方式。目录一变就重探，免得对着 A 游戏的状态操作 B 游戏。 */
+async function refreshInjections() {
+  try {
+    methods.value = await invoke<MethodStatus[]>("list_injections", {
+      gameDir: gameDir.value,
+    });
+  } catch (e: any) {
+    methods.value = [];
+    error.value = e?.message ?? String(e);
+  }
+}
+
+// 目录变了重探。immediate 让打开界面就先探一次，用户不用先点一下。
+watch(gameDir, refreshInjections, { immediate: true });
+
+/** 「未安装」和「需重装」都能装：后者就是覆盖重装一遍。 */
+function canInstall(m: MethodStatus) {
+  return m.state === "ready" || m.state === "stale";
+}
+
+/** 只有盘上真有 wtool 的东西才谈得上撤销。 */
+function canUninstall(m: MethodStatus) {
+  return m.state === "installed" || m.state === "stale";
+}
+
+/** 注入：把桥写进游戏目录。装完游戏要重启才生效，所以不在这儿自动开任务。 */
+async function installMethod(id: string) {
+  error.value = "";
+  try {
+    const lines = await invoke<string[]>("install_injection", {
+      gameDir: gameDir.value,
+      id,
+    });
+    logs.value.push(...lines);
+  } catch (e: any) {
+    error.value = e?.message ?? String(e);
+  }
+  await refreshInjections();
+}
+
+/** 取消注入：先停任务再还原文件 —— 任务还占着旧桥时去删文件容易打架。 */
+async function uninstallMethod(id: string) {
+  error.value = "";
+  try {
+    await invoke("stop_trans");
+    const lines = await invoke<string[]>("uninstall_injection", {
+      gameDir: gameDir.value,
+      id,
+    });
+    logs.value.push(...lines);
+  } catch (e: any) {
+    error.value = e?.message ?? String(e);
+  }
+  await refreshInjections();
+}
+
+/** 点「开始翻译」：先把变量交给 Rust，再起任务 */
+async function start() {
+  error.value = "";
+  logs.value = [];
+  try {
+    await invoke("set_config", {
+      gameDir: gameDir.value,
+      dictPath: dictPath.value,
+    });
+    await invoke("start_trans");
+  } catch (e: any) {
+    error.value = e?.message ?? String(e);
+  }
+}
+
+async function stop() {
+  await invoke("stop_trans");
+}
 
 async function load() {
   error.value = "";
   try {
     entries.value = await invoke<TsSentence[]>("load_dictionary", {
-      path: path.value,
+      path: dictPath.value,
     });
   } catch (e: any) {
     entries.value = [];
@@ -31,13 +148,70 @@ async function load() {
   <main class="container">
     <h1>wtool</h1>
 
-    <form @submit.prevent="load">
-      <input v-model="path" />
-      <button type="submit">查询</button>
+    <form class="config" @submit.prevent="start">
+      <label>
+        游戏目录
+        <input v-model="gameDir" />
+      </label>
+      <label>
+        词典文件
+        <input v-model="dictPath" />
+      </label>
+
+      <div class="row">
+        <button type="submit">开始翻译</button>
+        <button type="button" @click="stop">停止</button>
+        <button type="button" @click="load">读取词典</button>
+      </div>
     </form>
 
-    <p v-if="error"> {{ error }} </p>
-    <p v-else> 共 {{ entries.length }} 条 </p>
+    <p v-if="error" class="error">{{ error }}</p>
+
+    <section class="inject">
+      <h2>注入方式</h2>
+      <p v-if="!methods.length" class="hint">
+        这个游戏上还没有可用的注入方式。
+      </p>
+      <table v-else>
+        <thead>
+          <tr>
+            <th>方式</th>
+            <th>状态</th>
+            <th>说明</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="m in methods" :key="m.id">
+            <td>{{ m.name }}</td>
+            <td>{{ STATE_TEXT[m.state] }}</td>
+            <td class="detail">
+              {{ m.detail }}
+              <template v-if="m.state !== 'not_applicable'">
+                <br />撤销：{{ REVERSIBLE_TEXT[m.reversible] }}
+                <template v-if="m.restart_required">，装完要重启游戏</template>
+              </template>
+            </td>
+            <td class="ops">
+              <button type="button" :disabled="!canInstall(m)" @click="installMethod(m.id)">
+                注入
+              </button>
+              <button
+                type="button"
+                :disabled="!canUninstall(m)"
+                @click="uninstallMethod(m.id)"
+              >
+                取消注入
+              </button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <pre v-if="logs.length" class="logs">{{ logs.join("\n") }}</pre>
+
+    <p v-if="entries.length">共 {{ entries.length }} 条</p>
 
     <table v-if="entries.length">
       <thead>
@@ -91,6 +265,63 @@ th {
 
 .error {
   color: #d9534f;
+}
+
+.config label {
+  display: block;
+  margin: 0.4em 0;
+}
+
+.config input {
+  width: min(70vw, 720px);
+  margin-left: 0.5em;
+}
+
+.inject table {
+  margin: 0.5em auto;
+  text-align: left;
+}
+
+.inject .detail {
+  color: #888888;
+  font-size: 0.85em;
+}
+
+.inject .ops {
+  white-space: nowrap;
+}
+
+.inject .ops button {
+  padding: 0.3em 0.8em;
+  font-size: 0.85em;
+}
+
+.inject .ops button + button {
+  margin-left: 0.4em;
+}
+
+.inject .ops button:disabled {
+  cursor: default;
+  opacity: 0.45;
+  box-shadow: none;
+}
+
+.hint {
+  color: #888888;
+  font-size: 0.85em;
+}
+
+.logs {
+  max-height: 12em;
+  max-width: min(80vw, 900px);
+  margin: 1em auto;
+  padding: 0.6em 0.8em;
+  overflow: auto;
+  border: 1px solid #cccccc80;
+  border-radius: 8px;
+  font-size: 0.85em;
+  text-align: left;
+  white-space: pre-wrap;
 }
 </style>
 <style>

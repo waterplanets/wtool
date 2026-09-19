@@ -1,7 +1,18 @@
-# Tauri + Vue + TypeScript
+一个模仿mtool的多游戏引擎程序嵌入式实时翻译系统。
+当前只支持rpgmaker mv
 
-This template should help get you started developing with Vue 3 and TypeScript in Vite. The template uses Vue 3 `<script setup>` SFCs, check out the [script setup docs](https://v3.vuejs.org/api/sfc-script-setup.html#sfc-script-setup) to learn more.
 
-## Recommended IDE Setup
+D:\\myProgram\\game2\\lilisproject\\SUCCUBUS DESIRE ~リリスプロジェクト~
+上面是用来测试的程序
 
-- [VS Code](https://code.visualstudio.com/) + [Vue - Official](https://marketplace.visualstudio.com/items?itemName=Vue.volar) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+大体分为
+1 平台适配层。//暂时不考虑
+2 翻译读取层。
+3 指令层/前端层。
+
+
+engine提供各个引擎的标准接口
+model 提供数据定义
+task 提供主线程
+commands 提供前端直接调用的接口函数
+

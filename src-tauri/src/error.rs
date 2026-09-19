@@ -27,7 +27,7 @@ impl std::error::Error for Error {}
 
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
-        Self::new(format!("文件读写失败: {e}"))
+        Self::new(format!("IO 失败: {e}"))
     }
 }
 
