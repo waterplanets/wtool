@@ -57,6 +57,10 @@
  *     （整批问回来的那批文本不存在这个问题：dict 里早就有译文了。）
  *   - 上报给 wtool 的 text 永远是原文，写进游戏的才是译文，
  *     所以来回查表用的 key 不会互相污染。
+ *   - 游戏自己的主字体（System.json 的 advanced.mainFontFilename）若是日文字体，
+ *     cmap 里常有一批简体字是「有码位、轮廓为空」的占位。浏览器查到码位就不再
+ *     往后面的字体退，画出来是一片空白，玩家看到的就是「缺字」。本插件因此在
+ *     字体链最前面插一层系统中文字体（只认 CJK 表意字，见「字体」那一节）。
  *   - 不改 data/、不改词典文件，删掉本插件即完全恢复。
  */
 (function () {
@@ -335,6 +339,50 @@
         onClose();
         return _terminateMessage.apply(this, arguments);
     };
+
+    //-------------------------------------------------------------------------
+    // 字体：补上主字体画成空白的字
+    //-------------------------------------------------------------------------
+    //
+    // 本作 System.json 的 advanced.mainFontFilename 是 Logotype.otf，一份日文字体。
+    // 它 cmap 里有一批简体字的码位，但轮廓是空的 —— 实测译文用到的 3692 个不同
+    // 汉字里有 359 个落在这批「空白字」上，词典里 45% 的译文至少含一个。
+    // 浏览器查到「这个字体有这个码位」就不再往后面的字体退，于是画出来一片空白：
+    // 「读取存档」少个「档」，「帮助」少个「帮」—— 后者的空白落在行首，看起来
+    // 就像缩进错位。而「读/选/项/标/题」这类 Logotype 连码位都没有的字，反倒
+    // 正常退到了系统字体，显示是好的，所以一直看不出问题出在字体上。
+    //
+    // 修法：自己声明一层系统中文字体，插到字体链最前面，但用 unicode-range 把它
+    // 限制在 CJK 表意字上 —— 假名、标点、数字仍旧走游戏自己的字体，观感不变；
+    // 表意字交给系统中文字体，空白字就有字了。实测假名（ロ/ー/ド）的墨迹像素数
+    // 一模一样，确认没被换掉；而本机上没有这些字体时，整个 face 不可用，字体链
+    // 自动退回原样。只写 CSS 和内存里的 fontFace 字符串，磁盘上一个字节没改。
+    var CJK_LOCAL_FONTS = [
+        'Microsoft YaHei', 'SimHei', 'SimSun', 'Microsoft JhengHei',
+        'PingFang SC', 'Hiragino Sans GB', 'Noto Sans CJK SC',
+        'Source Han Sans SC', 'WenQuanYi Micro Hei'
+    ];
+
+    try {
+        var cjkSrc = CJK_LOCAL_FONTS.map(function (f) {
+            return 'local("' + f + '")';
+        }).join(', ');
+        var cjkStyle = document.createElement('style');
+        cjkStyle.textContent =
+            '@font-face{font-family:wtool-cjk;src:' + cjkSrc + ';' +
+            'unicode-range:U+3400-4DBF,U+4E00-9FFF,U+F900-FAFF;}';
+        (document.head || document.getElementsByTagName('head')[0]).appendChild(cjkStyle);
+
+        // numberFontFace() 就是 'rmmz-numberfont, ' + mainFontFace()，包住这一层
+        // 它自动跟着变，不用再包一次。
+        var _mainFontFace = Game_System.prototype.mainFontFace;
+        Game_System.prototype.mainFontFace = function () {
+            return 'wtool-cjk, ' + _mainFontFace.apply(this, arguments);
+        };
+    } catch (e) {
+        // 装不上就退回原样：缺字虽然难看，但比游戏起不来强。
+        console.warn(LOG + '字体补丁没装上', e);
+    }
 
     //-------------------------------------------------------------------------
     // 菜单词表：data/System.json 的 terms
@@ -761,7 +809,10 @@
     // 逻辑比较，改它没有副作用。
     var _dataOnLoad = DataManager.onLoad;
     DataManager.onLoad = function (object) {
-        if (DataManager.isMapObject(object) && typeof object.displayName === 'string') {
+        // 刻意不调 DataManager.isMapObject：那是 MZ 才有的，MV 上它是 undefined，
+        // 一调就 `is not a function`，游戏直接弹错误框。改按「谁带 displayName
+        // 字符串谁就是地图」判 —— 数据文件里只有地图对象有这个字段。
+        if (object && typeof object.displayName === 'string') {
             if (dict[object.displayName]) object.displayName = dict[object.displayName];
         }
         return _dataOnLoad.apply(this, arguments);
@@ -770,12 +821,34 @@
     // 这两张表都是数据库载入时才有的（$dataSystem 和 $dataItems 一起载入），
     // 这是唯一能保证它们已经存在的时机。但那一刻 socket 未必连上了，
     // 所以两头都要叫：这里叫一次、connect 那次也叫一次，谁先到就谁发，重了也无害。
-    var _onDatabaseLoaded = Scene_Boot.prototype.onDatabaseLoaded;
-    Scene_Boot.prototype.onDatabaseLoaded = function () {
-        _onDatabaseLoaded.apply(this, arguments);
+    var bootSent = false;
+
+    function sendBootTexts() {
+        // 数据库还没载入就什么都不做，也别置标记 —— 下一帧还会再叫。
+        if (typeof $dataSystem === 'undefined' || !$dataSystem) return;
+        if (bootSent) return;
+        bootSent = true;
         sendTerms();
         sendDbTexts();
         sendEventTexts();
+    }
+
+    // MZ 走这条。MV 上没有 onDatabaseLoaded 这个函数，跳过。
+    if (typeof Scene_Boot.prototype.onDatabaseLoaded === 'function') {
+        var _onDatabaseLoaded = Scene_Boot.prototype.onDatabaseLoaded;
+        Scene_Boot.prototype.onDatabaseLoaded = function () {
+            _onDatabaseLoaded.apply(this, arguments);
+            sendBootTexts();
+        };
+    }
+
+    // MV 走这条：isReady 转 true 的那一刻数据库已载入。MZ 上也有 isReady，
+    // 两边都挂，谁先到谁发，bootSent 保证只发一次。
+    var _bootIsReady = Scene_Boot.prototype.isReady;
+    Scene_Boot.prototype.isReady = function () {
+        var ready = _bootIsReady.apply(this, arguments);
+        if (ready) sendBootTexts();
+        return ready;
     };
 
     //-------------------------------------------------------------------------
@@ -948,11 +1021,15 @@
 
     // 和 onDatabaseLoaded 同理：onUniqueDataLoad 是 $DU 就绪的唯一信号，
     // 那一刻 socket 未必连上，所以两头都叫一次，谁先到谁发。
-    var _onUniqueDataLoad = Scene_Boot.prototype.onUniqueDataLoad;
-    Scene_Boot.prototype.onUniqueDataLoad = function () {
-        _onUniqueDataLoad.apply(this, arguments);
-        sendDuTexts();
-    };
+    // 这个钩子是游戏自带的 UniqueDataLoader 装上的，不是引擎 API，所以先确认
+    // 它真的在（没装这个插件的游戏就没有 $DU，也就没有这个钩子）。
+    if (typeof Scene_Boot.prototype.onUniqueDataLoad === 'function') {
+        var _onUniqueDataLoad = Scene_Boot.prototype.onUniqueDataLoad;
+        Scene_Boot.prototype.onUniqueDataLoad = function () {
+            _onUniqueDataLoad.apply(this, arguments);
+            sendDuTexts();
+        };
+    }
 
     //-------------------------------------------------------------------------
 

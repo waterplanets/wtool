@@ -7,8 +7,8 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use crate::dict::mtool;
-use crate::engine::get_engine_type;
 use crate::engine::inject::{self, MethodStatus};
+use crate::engine::{get_engine_type, resolve_game_dir};
 use crate::error::{Error, Result};
 use crate::model::TsSentence;
 use crate::task::{self, Config};
@@ -31,10 +31,21 @@ pub fn load_dictionary(path: &str) -> Result<Vec<TsSentence>> {
 #[tauri::command]
 pub fn set_config(game_dir: String, dict_path: String) -> bool {
     task::set_config(Config {
-        game_dir,
+        game_dir: resolve_game_dir(&game_dir).to_string_lossy().into_owned(),
         dict_path,
     });
     true
+}
+
+/// 猜这个目录是什么引擎、跑在什么运行时上，给界面显示。
+///
+/// 单开一个口子是为了让「认不出目录」这个症状自证：界面上写「未知引擎」，
+/// 就说明填的路径不是游戏根目录（或者路径不对），而不是这个游戏真没有
+/// 可用的注入方式 —— 否则两种情况的界面表现一模一样，没法查。
+#[tauri::command]
+pub fn detect_engine(game_dir: &str) -> String {
+    let kind = get_engine_type(&resolve_game_dir(game_dir));
+    format!("{}（{}）", kind.name(), kind.runtime().name())
 }
 
 /// 起一个后台任务。把新句柄放进 CURRENT，旧句柄被覆盖 = 自动 drop = 旧任务退出。
@@ -59,8 +70,8 @@ pub fn stop_trans() -> bool {
 /// 由界面去说「这个引擎还没有可用的注入方式」。
 #[tauri::command]
 pub fn list_injections(game_dir: &str) -> Vec<MethodStatus> {
-    let dir = Path::new(game_dir);
-    inject::status(get_engine_type(dir), dir)
+    let dir = resolve_game_dir(game_dir);
+    inject::status(get_engine_type(&dir), &dir)
 }
 
 /// 装上某个注入方式，把游戏目录改成能连上 wtool 的样子。
@@ -69,10 +80,10 @@ pub fn list_injections(game_dir: &str) -> Vec<MethodStatus> {
 /// 用户可以只注入、稍后自己开任务。
 #[tauri::command]
 pub fn install_injection(game_dir: &str, id: &str) -> Result<Vec<String>> {
-    let dir = Path::new(game_dir);
-    let method = inject::find(get_engine_type(dir), id)
+    let dir = resolve_game_dir(game_dir);
+    let method = inject::find(get_engine_type(&dir), id)
         .ok_or_else(|| Error::new(format!("这个游戏上没有叫「{id}」的注入方式")))?;
-    method.install(dir)
+    method.install(&dir)
 }
 
 /// 撤销某个注入方式，把游戏目录恢复原样。
@@ -81,10 +92,10 @@ pub fn install_injection(game_dir: &str, id: &str) -> Result<Vec<String>> {
 /// 的顺序调两次就行。这里保持「只搬运参数 + 转换错误」。
 #[tauri::command]
 pub fn uninstall_injection(game_dir: &str, id: &str) -> Result<Vec<String>> {
-    let dir = Path::new(game_dir);
-    let method = inject::find(get_engine_type(dir), id)
+    let dir = resolve_game_dir(game_dir);
+    let method = inject::find(get_engine_type(&dir), id)
         .ok_or_else(|| Error::new(format!("这个游戏上没有叫「{id}」的注入方式")))?;
-    method.uninstall(dir)
+    method.uninstall(&dir)
 }
 
 

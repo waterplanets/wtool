@@ -9,12 +9,14 @@ pub mod task;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             commands::load_dictionary,
             commands::set_config,
             commands::start_trans,
             commands::stop_trans,
             commands::list_injections,
+            commands::detect_engine,
             commands::install_injection,
             commands::uninstall_injection,
         ])

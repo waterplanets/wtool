@@ -26,7 +26,7 @@ pub mod inject;
 pub mod link;
 pub mod mz;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::Result;
 use crate::model::Dialogue;
@@ -93,6 +93,27 @@ impl EngineType {
             EngineType::Unknown => Runtime::Unknown,
         }
     }
+}
+
+/// 把用户填的那串路径收拾成一个游戏目录。
+///
+/// 用户是从文件管理器或别处复制粘贴过来的，粘进来什么样都有可能：Windows
+/// 复制路径默认带一对引号，前后可能还夹着空格，也可能干脆指到了
+/// `Game.exe` 而不是它所在的目录。这些都不该让下游每个 `is_file()` 去猜，
+/// 在入口处一次性收拾干净。
+///
+/// 之所以能容忍「指到 exe」：判据只看目录结构（见 [`get_engine_type`]），
+/// 多退回一层父目录没有任何歧义 —— 游戏的可执行文件就躺在游戏根目录里。
+pub fn resolve_game_dir(raw: &str) -> PathBuf {
+    let trimmed = raw.trim().trim_matches('"').trim();
+    let p = Path::new(trimmed);
+    // 指到文件（多半是 Game.exe）时，改用它所在的目录。
+    if p.is_file() {
+        if let Some(parent) = p.parent() {
+            return parent.to_path_buf();
+        }
+    }
+    p.to_path_buf()
 }
 
 /// 从一个目录猜游戏引擎——点「开始翻译」后自动走这一步，用户不用选。

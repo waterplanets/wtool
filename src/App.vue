@@ -2,6 +2,7 @@
 import { ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 
 /** 与 Rust 侧 model::TsSentence 一一对应 */
 interface TsSentence {
@@ -43,6 +44,17 @@ const gameDir = ref(
 );
 const dictPath = ref(`${gameDir.value}\\TrsData.bin`);
 
+/** 词典路径是否被手动改过。改过就不再跟着游戏目录自动改，免得覆盖用户的输入。 */
+const dictManual = ref(false);
+
+/** 游戏目录改了就顺手把词典路径带过去（MTool 的词典就放在游戏根目录）。 */
+watch(gameDir, (dir) => {
+  if (!dictManual.value) dictPath.value = `${dir}\\TrsData.bin`;
+});
+
+/** 识别出来的引擎，光看这一行就能判断路径填得对不对 */
+const engineName = ref("");
+
 const entries = ref<TsSentence[]>([]);
 const logs = ref<string[]>([]);
 const error = ref("");
@@ -59,12 +71,37 @@ listen<string>("trans-status", (e) => {
 /** 重新探测注入方式。目录一变就重探，免得对着 A 游戏的状态操作 B 游戏。 */
 async function refreshInjections() {
   try {
+    engineName.value = await invoke<string>("detect_engine", {
+      gameDir: gameDir.value,
+    });
+  } catch {
+    engineName.value = "";
+  }
+  try {
     methods.value = await invoke<MethodStatus[]>("list_injections", {
       gameDir: gameDir.value,
     });
   } catch (e: any) {
     methods.value = [];
     error.value = e?.message ?? String(e);
+  }
+}
+
+/** 从文件管理器挑游戏目录。目录判据在后端，选中直接填进去就行。 */
+async function pickGameDir() {
+  const dir = await open({ directory: true, multiple: false });
+  if (typeof dir === "string") gameDir.value = dir;
+}
+
+/** 从文件管理器挑词典文件，挑完就不跟着游戏目录自动改了。 */
+async function pickDict() {
+  const file = await open({
+    multiple: false,
+    filters: [{ name: "MTool 词典", extensions: ["bin", "json"] }],
+  });
+  if (typeof file === "string") {
+    dictPath.value = file;
+    dictManual.value = true;
   }
 }
 
@@ -152,11 +189,15 @@ async function load() {
       <label>
         游戏目录
         <input v-model="gameDir" />
+        <button type="button" @click="pickGameDir">选择目录</button>
       </label>
       <label>
         词典文件
-        <input v-model="dictPath" />
+        <input v-model="dictPath" @input="dictManual = true" />
+        <button type="button" @click="pickDict">选择文件</button>
       </label>
+
+      <p class="hint" v-if="engineName">检测到引擎：{{ engineName }}</p>
 
       <div class="row">
         <button type="submit">开始翻译</button>
@@ -275,6 +316,12 @@ th {
 .config input {
   width: min(70vw, 720px);
   margin-left: 0.5em;
+}
+
+.config label button {
+  margin-left: 0.4em;
+  padding: 0.4em 0.9em;
+  font-size: 0.85em;
 }
 
 .inject table {
