@@ -6,7 +6,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use crate::dict::mtool;
+use crate::dict;
 use crate::engine::inject::{self, MethodStatus};
 use crate::engine::{get_engine_type, resolve_game_dir};
 use crate::error::{Error, Result};
@@ -18,23 +18,74 @@ use crate::task::{self, Config};
 /// `Mutex::new` 是 const fn，所以能直接当 static 用，不用 OnceLock。
 static CURRENT: Mutex<Option<task::Handle>> = Mutex::new(None);
 
-/// 读取一份 MTool 词典文件，把词条列表交给前端。
+/// 读取一份词典文件，把词条列表交给前端。
+///
+/// 格式不用前端先选：MTool 的 JSON 和 wtool 自己的两种格式都认，认不出会报错。
 #[tauri::command]
 pub fn load_dictionary(path: &str) -> Result<Vec<TsSentence>> {
-    mtool::load_ts_file(Path::new(path))
+    dict::load_ts_file(Path::new(path))
 }
 
-/// 记下 GUI 上填的那几个变量（游戏目录、词典路径）。
+/// 记下 GUI 上填的那几个变量（游戏目录、词典路径、目标字体）。
 ///
 /// 全局就一份，存在 `task` 里；点「开始翻译」之前调一次，
 /// `start_trans` 起的线程会自己读。
 #[tauri::command]
-pub fn set_config(game_dir: String, dict_path: String) -> bool {
+pub fn set_config(
+    game_dir: String,
+    dict_path: String,
+    font: String,
+    translate_backend: String,
+    corpus_path: String,
+    out_path: String,
+    llm_base_url: String,
+    llm_model: String,
+    llm_api_key: String,
+    llm_batch: usize,
+) -> bool {
+    // gtx 是默认后端（免费零配置）；空串或别的值按 gtx 处理。
+    let backend = if translate_backend.trim() == "llm" {
+        "llm"
+    } else {
+        "gtx"
+    };
     task::set_config(Config {
         game_dir: resolve_game_dir(&game_dir).to_string_lossy().into_owned(),
         dict_path,
+        font,
+        translate_backend: backend.to_string(),
+        collect: false,
+        corpus_path,
+        out_path,
+        llm_base_url,
+        llm_model,
+        llm_api_key,
+        llm_batch,
     });
     true
+}
+
+/// 离线翻译：后台线程把语料翻成词典（`--translate` 的 GUI 版）。语料/输出/后端/
+/// LLM 配置都已由 `set_config` 收好，这里只负责起线程、把进度经 `trans-status`
+/// 推给前端。
+#[tauri::command]
+pub fn start_translate_file(app: tauri::AppHandle) -> Result<()> {
+    task::trainning_translate(&app)
+}
+
+/// 在线采集：起后台线程，让玩家正常玩一遍攒语料。游戏目录/语料路径在 `set_config`
+/// 已收好；这个任务放进 `CURRENT`，前端「停止」按钮能停（和直播翻译同一套语义）。
+#[tauri::command]
+pub fn start_collect(app: tauri::AppHandle) -> Result<()> {
+    *CURRENT.lock().unwrap() = Some(task::trainning_collect(&app)?);
+    Ok(())
+}
+
+/// 离线扫描：不开游戏，直接扫游戏目录收语料，返回条数给人看。同步执行，很快。
+#[tauri::command]
+pub fn collect_offline(game_dir: String, out: String) -> Result<String> {
+    // collect_offline 内部自己 resolve 游戏目录，这里原样透传即可。
+    task::collect_offline(&game_dir, Path::new(&out))
 }
 
 /// 猜这个目录是什么引擎、跑在什么运行时上，给界面显示。

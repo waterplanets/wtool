@@ -1,9 +1,11 @@
 pub mod commands;
+pub mod corpus;
 pub mod dict;
 pub mod engine;
 pub mod error;
 pub mod model;
 pub mod task;
+pub mod translate;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -15,6 +17,9 @@ pub fn run() {
             commands::set_config,
             commands::start_trans,
             commands::stop_trans,
+            commands::start_translate_file,
+            commands::start_collect,
+            commands::collect_offline,
             commands::list_injections,
             commands::detect_engine,
             commands::install_injection,

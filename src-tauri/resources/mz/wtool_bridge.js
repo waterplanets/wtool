@@ -29,6 +29,7 @@
  *     {"cmd":"current"}                                       回一条当前 text
  *     {"cmd":"apply","seq":1,"from":"原文","text":"译文"}      替换该段
  *     {"cmd":"terms","map":{"原文":"译文"}}                    回翻得出的词条
+ *     {"cmd":"font","font":"Microsoft YaHei"}                 换主字体（空串 = 恢复原字体）
  *
  * 取值（控制台里可直接用）：
  *   wtool.current()    当前对话框快照 { active, seq, lines, text }
@@ -51,6 +52,11 @@
  *   - 选项、说话人名、地图名、战斗事件里的对话，都不走「上报 → 回写」那条道
  *     （它们在渲染时同步取字，等不了一趟往返），所以和数据库文本一样，
  *     开机整批问回来存在本地 dict 里，各处渲染前同步取译文。
+ *   - 菜单、列表这类**整串画**的窗口（含 SceneCustomMenu 那种把文字写在插件
+ *     参数里、前面几条整批管道都碰不到的自定义菜单）挂在 drawText/drawTextEx
+ *     上：画之前先查本地 dict，没见过的串攒一批问 wtool，回话到了让窗口重画。
+ *     所以第一次翻开是日文、紧接着变中文；之后一直从 dict 同步取。
+ *     刻意不挂 Bitmap.drawText —— 那是逐字画的落点，手里只有一个字符。
  *   - 某段对话「第一次」出现时，wtool 还没把译文送回来，画出来的仍是原文；
  *     等回写到达后本插件会让消息窗口重画一次，视觉上可能闪一下。
  *     之后同样的文本再出现，就会在画之前同步替换，不再闪。
@@ -61,6 +67,11 @@
  *     cmap 里常有一批简体字是「有码位、轮廓为空」的占位。浏览器查到码位就不再
  *     往后面的字体退，画出来是一片空白，玩家看到的就是「缺字」。本插件因此在
  *     字体链最前面插一层系统中文字体（只认 CJK 表意字，见「字体」那一节）。
+ *   - 事件指令里的台词可以直接写 \v[439] 这种变量引用（真台词在别处用 122 指令
+ *     塞进变量），引擎是画字那一刻才展开的。本插件上报前先自己展开 \v[n]，
+ *     否则上报出去的是字面量 "\v[439]"，词典里查不到，整段都翻不了。
+ *     只展开变量，其余控制码（\c[2]、\i[127]）原样保留 —— 词典的 key 就是
+ *     玩家真正看到的原文，里面不含控制码。
  *   - 不改 data/、不改词典文件，删掉本插件即完全恢复。
  */
 (function () {
@@ -184,6 +195,17 @@
             applyTerms(map);
             applyDbTexts(map);
             applyDuTexts(map);
+            // 「窗口文本」那批回话到了：已经画上去的日文不会自己变，让窗口重画。
+            // 判据是 map 里有没有我们问过的那几串，免得开机那几批也白白重画一遍。
+            for (var k in map) {
+                if (askedDrawn[k]) {
+                    refreshWindows();
+                    break;
+                }
+            }
+        } else if (msg.cmd === 'font') {
+            // 目标字体：wtool 连上时下发一次，之后只在换配置时再来。
+            setFont(msg.font);
         }
     }
 
@@ -273,8 +295,46 @@
         return out;
     }
 
+    // 展开 \v[n] —— 台词存在变量里的情况。
+    //
+    // 事件指令可以只写一句 \v[439]，真正的台词在事件开头用 122 指令塞进变量 439。
+    // MZ 是**画字那一刻**才把 \v[n] 换成 $gameVariables.value(n) 的
+    // （rmmz_windows.js 的 convertEscapeCharacters），而我们在 startMessage 里
+    // 就上报了 —— 那会儿拿到的是字面量 "\v[439]"，拿这串查词典必然查不到，
+    // 玩家看到的就是整段没翻。实测这个游戏有 50+ 张地图这么写，不是个例。
+    //
+    // 只展开变量这一种码：词典的 key 就是玩家真正看到的原文，里面不含任何
+    // 控制码（实测词典里 \v[ / \c[ / \i[ 开头的 key 一个都没有）。别的码
+    // （\c[2] 改色、\i[127] 图标）展开不了也不该展开 —— 留着原样，游戏自己会画。
+    function expandVariables(text) {
+        if (typeof text !== 'string' || text.indexOf('\\') < 0) return text;
+        if (typeof $gameVariables === 'undefined' || !$gameVariables) return text;
+
+        // 变量值里还可能再套一层 \v[n]，MZ 自己也是循环展开的，这里跟上。
+        // 加个次数上限，万一有自引用（\v[439] 指向变量 439 自己）不会死循环。
+        var guard = 0;
+        while (guard++ < 10 && /\\v\[\d+\]/i.test(text)) {
+            text = text.replace(/\\v\[(\d+)\]/gi, function (m, n) {
+                try {
+                    var v = $gameVariables.value(parseInt(n, 10));
+                    return v == null ? '' : String(v);
+                } catch (e) {
+                    // 取不到值就原样留着：宁可这行没翻，也别把内容弄丢。
+                    return m;
+                }
+            });
+        }
+        return text;
+    }
+
     function onOpen() {
-        var lines = flatten($gameMessage._texts || []);
+        // 先把 \v[n] 展开再摊平：展开后的才是玩家真正看到的原文，
+        // 也才是词典里 key 的样子。不展开就整段查不中。
+        var raw = $gameMessage._texts || [];
+        var src = [];
+        for (var i = 0; i < raw.length; i++) src.push(expandVariables(String(raw[i])));
+
+        var lines = flatten(src);
         var text = lines.join('\n');
 
         // 有些消息不是事件指令 401 写死的，是脚本拼出来再 addText 的
@@ -382,6 +442,35 @@
     } catch (e) {
         // 装不上就退回原样：缺字虽然难看，但比游戏起不来强。
         console.warn(LOG + '字体补丁没装上', e);
+    }
+
+    //-------------------------------------------------------------------------
+    // 目标字体：GUI 上选的，运行时由 wtool 下发
+    //-------------------------------------------------------------------------
+    //
+    // 上面那层 CJK 补丁只补「有码位、轮廓为空」的表意字，假名和标点仍走游戏
+    // 自带的日文字体。用户在 wtool 界面上可以另选一个系统中文字体，把整个主
+    // 字体换掉 —— 这时假名、数字也一起换成所选字体。
+    //
+    // 包在 CJK 补丁外面，链子就是「用户字体, wtool-cjk, 游戏原字体」：
+    // 用户字体优先（整体替换），wtool-cjk 退居兜底（补用户字体也缺的表意字），
+    // 原字体垫底，前面都不可用时自动回落。钩子只装一次，之后只改 targetFont。
+    var targetFont = '';
+
+    var _mainFontFaceWithCjk = Game_System.prototype.mainFontFace;
+    Game_System.prototype.mainFontFace = function () {
+        var base = _mainFontFaceWithCjk.apply(this, arguments);
+        // 字体名用双引号包起来，带空格的名字（Microsoft YaHei）也成立。
+        return targetFont ? '"' + targetFont + '", ' + base : base;
+    };
+
+    function setFont(name) {
+        var next = typeof name === 'string' ? name.trim() : '';
+        if (next === targetFont) return;
+        targetFont = next;
+        // 已经画出去的字不会自己变，让消息窗口先跟上；其余窗口下次刷新自然生效。
+        if (state.active) repaint();
+        if (debug) console.log(LOG + '目标字体：' + (targetFont || '（游戏原字体）'));
     }
 
     //-------------------------------------------------------------------------
@@ -788,13 +877,16 @@
 
     // 选项：Window_ChoiceList 是从 $gameMessage._choices 取字画的，在它
     // refresh 之前换掉就行。402 是按下标分支的，换字不影响流程。
+    //
+    // 和对话正文同理，选项里也可能写 \v[n]（实测这个游戏就有
+    // `\i[127]略奪 \c[2][自衛力:\v[373]]` 这种），先展开再查表。
     function replaceChoices() {
         var choices = $gameMessage._choices;
         if (!Array.isArray(choices)) return;
         for (var i = 0; i < choices.length; i++) {
-            if (typeof choices[i] === 'string' && dict[choices[i]]) {
-                choices[i] = dict[choices[i]];
-            }
+            if (typeof choices[i] !== 'string') continue;
+            var hit = dict[expandVariables(choices[i])];
+            if (hit) choices[i] = hit;
         }
     }
 
@@ -816,6 +908,101 @@
             if (dict[object.displayName]) object.displayName = dict[object.displayName];
         }
         return _dataOnLoad.apply(this, arguments);
+    };
+
+    //-------------------------------------------------------------------------
+    // 窗口文本：菜单、列表这类「整串画」的地方
+    //-------------------------------------------------------------------------
+    //
+    // 对话是逐字画的（Window_Message 一帧一个字地 processCharacter），所以那边
+    // 只能挂在 startMessage 上；菜单不一样 —— 它调 drawTextEx/drawText 时手里
+    // 就是**完整的一串**，这正是查表要的粒度。
+    //
+    // 为什么以前翻不到：本作的自定义菜单（SceneCustomMenu）把菜单项文字写在
+    // **插件参数**里（js/plugins.js 的 SceneCustomMenu.Scene1 → "\I[188]手帳"），
+    // 既不进 $dataSystem.terms，也不进那四张数据库表，前面几条「整批问」的管道
+    // 一条都碰不到它，所以屏幕上一直是日文。而 MTool 把整本词典灌进游戏进程，
+    // 是画字那一刻同步查的，自然不受这个限制。
+    //
+    // 这里补上同一条路：画之前先查 dict；dict 里没有就先记下来，攒一批问 wtool
+    // （走 loose，让 wtool 那边退级去啃整串里的片段），等回话到了让窗口重画一遍。
+    // 第一遍仍然是日文（本机 socket，通常几毫秒就回来了），第二遍起是中文 ——
+    // 和对话那套「先画原文、回写到了再重画」是同一个取舍。
+    //
+    // 只挂 Window_Base 的 drawText/drawTextEx，**不挂 Bitmap.drawText**：逐字绘制
+    // 最终落在 contents.drawText（Bitmap 上的），那会儿手里只有一个字符，拿单字
+    // 查表正是之前「どこに行くの？→ どこ中行くの？」那类文本错位的成因。这里拿到的
+    // 永远是整串，查不到原样放行，啃不到单字。
+
+    // 已经问过 wtool 的串（含没翻上的）。重画很频繁，不能每次都重问。
+    var askedDrawn = Object.create(null);
+    // 攒着待问的。画字每帧都可能发生，一条一发会把 socket 打满。
+    var pendingDrawn = Object.create(null);
+    var drainTimer = 0;
+
+    // 值不值得问。得至少有假名或表意字 —— 纯 ASCII 的数字、伤害值、存档槽位
+    // 问了也是白问；而词典里那些真译文要挡掉，否则中文被当成原文再翻一遍，
+    // wtool 的片段匹配能把它改出鬼来（实测抽样 2.7%）。译文都进过 translated 名单。
+    function worthAsking(s) {
+        if (s.length < 2) return false;
+        if (translated[s] || dict[s]) return false;
+        return /[\u3040-\u30ff\u3400-\u9fff\uff66-\uff9f]/.test(s);
+    }
+
+    function learnDrawn(text) {
+        if (!socket || socket.destroyed) return;   // 还没连上，问了也没人接
+        if (askedDrawn[text] || !worthAsking(text)) return;
+        askedDrawn[text] = true;
+        pendingDrawn[text] = true;
+        if (!drainTimer) drainTimer = setTimeout(drainDrawn, 50);
+    }
+
+    function drainDrawn() {
+        drainTimer = 0;
+        var texts = [];
+        for (var k in pendingDrawn) texts.push(k);
+        pendingDrawn = Object.create(null);
+        if (!texts.length) return;
+        send({ ev: 'terms', loose: true, label: '窗口文本', texts: texts });
+        if (debug) console.log(LOG + '窗口文本 ' + texts.length + ' 条，已问 wtool');
+    }
+
+    // 画之前把整串换掉。dict 里有就换，没有就原样返回（同时记下来去问）。
+    function translateDrawn(text) {
+        if (typeof text !== 'string' || !text) return text;
+        var hit = dict[text];
+        if (hit) return hit;
+        learnDrawn(text);
+        return text;
+    }
+
+    // 回话到了，让当前画面上那些窗口重画一遍 —— 否则已经画上去的日文不会自己变。
+    // 跳过消息窗口：它有自己那套（applyTranslation → repaint），在这里重画会把
+    // 正逐字打着的那句从头再打一遍。
+    function refreshWindows() {
+        var scene = typeof SceneManager !== 'undefined' ? SceneManager._scene : null;
+        var layer = scene ? scene._windowLayer : null;
+        if (!layer || !layer.children) return;
+        var msg = scene._messageWindow;
+        for (var i = 0; i < layer.children.length; i++) {
+            var w = layer.children[i];
+            if (w === msg || !w || typeof w.refresh !== 'function') continue;
+            try {
+                w.refresh();
+            } catch (e) {
+                // 单个窗口刷新失败不该拖垮别的。
+            }
+        }
+    }
+
+    var _winDrawText = Window_Base.prototype.drawText;
+    Window_Base.prototype.drawText = function (text, x, y, maxWidth, align) {
+        return _winDrawText.call(this, translateDrawn(text), x, y, maxWidth, align);
+    };
+
+    var _winDrawTextEx = Window_Base.prototype.drawTextEx;
+    Window_Base.prototype.drawTextEx = function (text, x, y, width) {
+        return _winDrawTextEx.call(this, translateDrawn(text), x, y, width);
     };
 
     // 这两张表都是数据库载入时才有的（$dataSystem 和 $dataItems 一起载入），

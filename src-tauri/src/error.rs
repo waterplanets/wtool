@@ -37,4 +37,10 @@ impl From<serde_json::Error> for Error {
     }
 }
 
+impl From<reqwest::Error> for Error {
+    fn from(e: reqwest::Error) -> Self {
+        Self::new(format!("HTTP 请求失败: {e}"))
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;

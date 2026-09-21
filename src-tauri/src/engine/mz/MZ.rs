@@ -24,6 +24,7 @@
 //!     {"cmd":"current"}                               问一次「现在显示的是什么」
 //!     {"cmd":"apply","seq":1,"from":"原文","text":"译文"}
 //!     {"cmd":"terms","map":{"原文":"译文"}}            回问过来那批词条里翻得出的
+//!     {"cmd":"font","font":"Microsoft YaHei"}         换主字体（空串 = 恢复原字体）
 //! ```
 
 use serde_json::{json, Map, Value};
@@ -37,6 +38,7 @@ use crate::model::Dialogue;
 const CMD_CURRENT: &str = "current";
 const CMD_APPLY: &str = "apply";
 const CMD_TERMS: &str = "terms";
+const CMD_FONT: &str = "font";
 
 /// RPG Maker MZ（同时也是 MV）。
 ///
@@ -167,6 +169,12 @@ impl<L: Link> Engine for MzEngine<L> {
             .collect();
 
         let msg = json!({ "cmd": CMD_TERMS, "map": Value::Object(obj) });
+        self.link.send(&msg.to_string())
+    }
+
+    fn set_font(&mut self, font: &str) -> Result<()> {
+        // 空串也照发：游戏侧收到会把目标字体清空、退回原字体，语义明确。
+        let msg = json!({ "cmd": CMD_FONT, "font": font });
         self.link.send(&msg.to_string())
     }
 }

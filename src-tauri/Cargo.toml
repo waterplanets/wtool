@@ -23,6 +23,10 @@ tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# reqwest 不是新引入的第三方 —— tauri 依赖树里本来就有它（tauri 内部网络请求
+# 用的就是 reqwest）。这里显式声明并启用 blocking + json 两个 feature，直接复用，
+# 避免再引一个 HTTP 栈。翻译层的 worker 线程用阻塞客户端最直白。
+reqwest = { version = "0.12", features = ["json", "blocking"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

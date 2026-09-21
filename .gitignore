@@ -23,3 +23,7 @@ dist-ssr
 *.sln
 *.sw?
 .trae
+
+# wtool generated test artifacts
+src-tauri/.probe_corpus/
+src-tauri/probe_translate/

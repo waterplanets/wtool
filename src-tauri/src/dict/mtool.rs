@@ -6,12 +6,15 @@
 //!
 //! 所以查表要按粒度退级：**整段 → 单行 → 片段**。前两级是精确匹配，
 //! 第三级是「最长优先、从左往右」的片段替换。
+//!
+//! 这个文件里还住着 [`Dict`] —— 它是「建好索引的词典」本身，跟 MTool 没关系：
+//! 读 MTool 的 JSON 只是 [`load_index`] 这一个函数，词条从哪个格式来由
+//! [`crate::dict::format`] 分派。`Dict` 只认「已经解析好的那张表」。
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::error::Result;
-use crate::model::TsSentence;
 
 /// 建好索引的词典。
 pub struct Dict {
@@ -27,13 +30,14 @@ pub struct Dict {
 }
 
 impl Dict {
-    /// 读词典并建好索引：原文 → 译文。
+    /// 拿一张「原文 → 译文」的表建好索引。
+    ///
+    /// 表从哪来不管（MTool 的 JSON、wtool 的行式文本、wtool 的 JSON 都行，
+    /// 由 [`crate::dict::format`] 分派）—— 这一层只认已经解析好的表。
     ///
     /// 翻译循环每句话都要查一次，1.6 MB 的词典扛不住线性扫，所以查表用的是
     /// `BTreeMap`（几次字符串比较），而不是把整份转成 `Vec` 再从头找。
-    pub fn load(path: &Path) -> Result<Self> {
-        let map = load_index(path)?;
-
+    pub fn from_map(map: BTreeMap<String, String>) -> Self {
         // 只收「字符数 ≥ 2」的档位，见 `fragments` 里对单字 key 的说明。
         let mut lens: Vec<usize> = map
             .keys()
@@ -43,7 +47,7 @@ impl Dict {
         lens.sort_unstable_by(|a, b| b.cmp(a));
         lens.dedup();
 
-        Ok(Self { map, lens })
+        Self { map, lens }
     }
 
     pub fn len(&self) -> usize {
@@ -252,22 +256,12 @@ fn message_template(key: &str) -> Option<&'static str> {
     })
 }
 
-/// 读词典文件，原样返回「原文 → 译文」的表。
+/// 读 MTool 的 `TrsData.json`，原样返回「原文 → 译文」的表。
 ///
 /// 不做 `\n` 摊平之类的加工：key 就是文件里那个样子，改一个字节都可能对不上。
+/// 走 [`crate::dict::format::read_text`] 而不是直接 `read_to_string`，是为了顺手
+/// 去掉 UTF-8 BOM —— 编辑器加的那个 `\u{feff}` 会让 serde 在第一行就报错。
 pub fn load_index(path: &Path) -> Result<BTreeMap<String, String>> {
-    let raw: String = std::fs::read_to_string(path)?;
+    let raw = crate::dict::format::read_text(path)?;
     Ok(serde_json::from_str(&raw)?)
-}
-
-/// 读取词典文件，转成内部统一模型 —— 给前端的词条列表用。
-///
-/// 之所以不直接把 `BTreeMap` 交出去：
-/// MTool 的格式是「不由我们定义的外部契约」，一旦泄漏到上层，
-/// 将来换格式就要动全工程。这里多做一步转换，把脏东西挡在外面。
-pub fn load_ts_file(path: &Path) -> Result<Vec<TsSentence>> {
-    Ok(load_index(path)?
-        .into_iter()
-        .map(|(source, target)| TsSentence { source, target })
-        .collect())
 }

@@ -25,11 +25,13 @@ use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter};
 
-use crate::dict::mtool;
+use crate::corpus::{self, online};
+use crate::dict::{DictFormat, mtool, wtool};
 use crate::engine::inject::{self, State};
+use crate::translate;
 use crate::engine::link::{TcpLink, PORT};
 use crate::engine::mz::MZ::MzEngine;
-use crate::engine::{get_engine_type, Engine, EngineType, Event};
+use crate::engine::{get_engine_type, resolve_game_dir, Engine, EngineType, Event};
 use crate::error::{Error, Result};
 
 /// 往前端推状态的通道名。前端 `listen("trans-status", ...)`。
@@ -46,14 +48,43 @@ const TICK: Duration = Duration::from_millis(100);
 pub struct Config {
     /// 游戏根目录，也就是 `Game.exe` 所在的那个目录。
     pub game_dir: String,
-    /// 词典文件（`TrsData.bin`）的路径。
+    /// 词典文件（`TrsData.json`）的路径。
+    ///
+    /// 只在翻译模式下必须。采集模式不查词典，空串也放行。
     pub dict_path: String,
+    /// 目标字体名（系统中文字体）。空串 = 不替换，只走桥里那层 CJK 缺字兜底。
+    pub font: String,
+    /// 翻译后端：`gtx`（Google 网页接口，免费零配置）或 `llm`（OpenAI 兼容接口）。
+    pub translate_backend: String,
+    /// 是不是「采集模式」：不翻只攒料，收到的原文落进 `corpus_path`（第 2 步）。
+    pub collect: bool,
+    /// 采集模式落盘的语料文件路径。
+    pub corpus_path: String,
+    /// 离线翻译产出的词典文件路径（`--out`）。
+    pub out_path: String,
+    /// LLM 接口基址（OpenAI 兼容），如 `https://api.deepseek.com`。
+    pub llm_base_url: String,
+    /// LLM 模型名，如 `deepseek-chat`。
+    pub llm_model: String,
+    /// LLM API key（Bearer）。GUI 暂无翻译入口，主要从命令行 `--key` 传进来。
+    pub llm_api_key: String,
+    /// 一次请求喂多少条原文。
+    pub llm_batch: usize,
 }
 
 // `String::new()` 和 `Mutex::new()` 都是 const fn，所以这里能直接静态初始化。
 static CONFIG: Mutex<Config> = Mutex::new(Config {
     game_dir: String::new(),
     dict_path: String::new(),
+    font: String::new(),
+    translate_backend: String::new(),
+    collect: false,
+    corpus_path: String::new(),
+    out_path: String::new(),
+    llm_base_url: String::new(),
+    llm_model: String::new(),
+    llm_api_key: String::new(),
+    llm_batch: 20,
 });
 
 /// 写入配置，由 `commands::set_config` 在点「开始翻译」之前调用。
@@ -88,25 +119,54 @@ pub fn trainning(app: &AppHandle) -> Handle {
     Handle { _stop: stop_tx }
 }
 
+/// 在线采集：起后台线程跑 [`run_collecting`]，让玩家正常玩一遍攒语料。
+///
+/// 语料文件路径从配置读（`--corpus`/界面的「语料文件」）。返回的 `Handle` 一 drop
+/// 就停 —— 和 [`trainning`] 同一套停止语义，前端「停止」按钮直接复用。
+pub fn trainning_collect(app: &AppHandle) -> Result<Handle> {
+    let cfg = config();
+    if cfg.game_dir.trim().is_empty() {
+        return Err(Error::new("还没填游戏目录"));
+    }
+    if cfg.corpus_path.trim().is_empty() {
+        return Err(Error::new("还没填语料文件路径"));
+    }
+
+    let sink = AppSink(app.clone());
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    thread::spawn(move || match run_collecting(&sink, stop_rx) {
+        Ok(()) => sink.say("采集结束".to_string()),
+        Err(e) => sink.say(format!("采集结束：{e}")),
+    });
+    Ok(Handle { _stop: stop_tx })
+}
+
 /// 命令行模式：不开窗口，把「开始翻译」那一整套原样跑一遍。
 ///
 /// 存在的意义是自测 —— 图形界面点一遍要动鼠标，命令行一条命令起、
 /// 日志直接打在终端上。阻塞到出错或者进程被杀（后者等价于「停止」）。
 pub fn run_cli(cfg: Config) {
+    let collecting = cfg.collect; // 置入全局前先记住，等会儿选结束语。
     set_config(cfg);
 
     // 这个 Sender 活到函数结束，所以 `recv_timeout` 永远只会超时，不会 Disconnected。
     let (_stop_tx, stop_rx) = mpsc::channel::<()>();
 
     match run(&StdoutSink, stop_rx) {
-        Ok(()) => println!("[wtool] 翻译结束"),
-        Err(e) => eprintln!("[wtool] 翻译出错：{e}"),
+        Ok(()) => println!("[wtool] {}", if collecting { "采集结束" } else { "翻译结束" }),
+        Err(e) => eprintln!("[wtool] 出错：{e}"),
     }
 }
 
 /// 线程主体。返回即任务退出（正常停止或者出错）。
 fn run(sink: &dyn Reporter, stop_rx: Receiver<()>) -> Result<()> {
     let cfg = config();
+
+    // 采集模式是另一套循环（只攒料不翻），先分出去，别让翻译主循环被 `if` 塞满。
+    if cfg.collect {
+        return run_collecting(sink, stop_rx);
+    }
+
     let game_dir = cfg.game_dir.trim();
     let dict_path = cfg.dict_path.trim();
 
@@ -126,8 +186,12 @@ fn run(sink: &dyn Reporter, stop_rx: Receiver<()>) -> Result<()> {
         ));
     }
 
-    let dict = mtool::Dict::load(Path::new(dict_path))?;
-    sink.say(format!("词典载入 {} 条", dict.len()));
+    // 词典是什么格式自己认（MTool 的 JSON / wtool 的行式文本 / wtool 的 JSON）。
+    // 认不出来会在这一行报错，日志里说清是哪个文件、支持哪些格式。
+    let dict_path = Path::new(dict_path);
+    let fmt = DictFormat::sniff(dict_path)?;
+    let dict = mtool::Dict::from_map(fmt.load(dict_path)?);
+    sink.say(format!("词典载入 {} 条（{}）", dict.len(), fmt.name()));
 
     // 挑一条注入方式把通道架进去。
     //
@@ -187,6 +251,12 @@ fn run(sink: &dyn Reporter, stop_rx: Receiver<()>) -> Result<()> {
                 sink.say("游戏已连上".to_string());
                 // 万一这会儿游戏已经显示着对话框，补问一次当前内容。
                 engine.refresh()?;
+                // 目标字体跟任务走：连上时下发一次。空串表示不换，游戏保持原字体，
+                // 只靠桥里那层 CJK 兜底补缺字。
+                if !cfg.font.is_empty() {
+                    engine.set_font(&cfg.font)?;
+                    sink.say(format!("目标字体：{}", cfg.font));
+                }
             }
 
             Event::Text(d) => match dict.translate(&d.text) {
@@ -246,6 +316,265 @@ fn run(sink: &dyn Reporter, stop_rx: Receiver<()>) -> Result<()> {
 
                 sink.say(format!("{label} {} 条，翻上 {} 条", texts.len(), map.len()));
             }
+        }
+    }
+}
+
+/// 扫描游戏目录、离线收一份语料并写盘，返回给人看的话。
+///
+/// 不启动游戏、不注入 —— 纯粹读 `data/*.json` 和 `js/plugins.js`，出条数。
+/// 命令行 `--offline-collect` 走这条；GUI 的第 3 步再接管。
+pub fn collect_offline(game_dir: &str, out: &std::path::Path) -> Result<String> {
+    let dir = resolve_game_dir(game_dir);
+    let c = corpus::offline::scan(&dir)?;
+    let n = corpus::save(out, &c)?;
+    Ok(format!(
+        "{} 扫描完毕，{}，已写进 {}（去重 {n} 条）",
+        dir.display(),
+        c.stats(),
+        out.display()
+    ))
+}
+
+/// 命令行翻译入口：读语料 + 目标词典（断点续传集）→ 调翻译后端 → 写回目标词表。
+///
+/// `out` 是 wtool 词典文件：这次翻的新译文合并**已存在**的译文一起写回同一个
+/// 文件，所以这文件可以安全地跨多次运行累积——每次只补翻缺的那部分（`resume`）。
+/// 后端在配置里选：`translate_backend == "gtx"` 走免费谷歌接口（零配置），
+/// 其余值（如 `"llm"`）走 OpenAI 兼容接口（要 base/model/key）。
+pub fn translate_cli(corpus_path: &str, out_path: &str) -> Result<String> {
+    run_translate_file(&StdoutSink, corpus_path, out_path)
+}
+
+/// 离线翻译入口：起一个后台线程跑 [`run_translate_file`]，进度走 `trans-status`。
+///
+/// 只许一个离线任务在跑：多个同时起会并发写同一个输出文件，把文件搅乱、
+/// 也会让 gtx/LLM 同时打请求触发 429。第二个点「开始」直接报错拦住。
+pub fn trainning_translate(app: &AppHandle) -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static BUSY: AtomicBool = AtomicBool::new(false);
+    if BUSY.swap(true, Ordering::SeqCst) {
+        return Err(Error::new("已有离线翻译在跑，等它结束再试"));
+    }
+
+    let cfg = config();
+    let corpus_path = cfg.corpus_path.trim().to_string();
+    let out_path = cfg.out_path.trim().to_string();
+    if corpus_path.is_empty() {
+        BUSY.store(false, Ordering::SeqCst);
+        return Err(Error::new("还没填语料文件路径（--corpus）"));
+    }
+    if out_path.is_empty() {
+        BUSY.store(false, Ordering::SeqCst);
+        return Err(Error::new("还没填输出词典路径"));
+    }
+
+    let sink = AppSink(app.clone());
+    thread::spawn(move || {
+        sink.say("开始离线翻译…".to_string());
+        let result = run_translate_file(&sink, &corpus_path, &out_path);
+        BUSY.store(false, Ordering::SeqCst);
+        match result {
+            Ok(msg) => sink.say(msg),
+            Err(e) => sink.say(format!("离线翻译出错：{e}")),
+        }
+    });
+    Ok(())
+}
+
+/// 真正的翻译主体：把语料翻成词典。CLI 与 GUI 共用一条道，`sink` 决定进度往哪说。
+///
+/// `out` 是 wtool 词典文件：这次翻的新译文合并**已存在**的译文一起写回同一个
+/// 文件，所以这文件可以安全地跨多次运行累积——每次只补翻缺的那部分（`resume`）。
+/// 后端在配置里选：`translate_backend == "gtx"` 走免费谷歌接口（零配置），
+/// 其余值（如 `"llm"`）走 OpenAI 兼容接口（要 base/model/key）。
+fn run_translate_file(
+    sink: &dyn Reporter,
+    corpus_path: &str,
+    out_path: &str,
+) -> Result<String> {
+    let cfg = config();
+
+    // 翻译后端二选一：gtx 免费零配置；llm 要 base/model/key 三样都齐了才行。
+    let use_gtx = cfg.translate_backend.trim() == "gtx";
+    if !use_gtx && cfg.llm_api_key.trim().is_empty() {
+        return Err(Error::new("没给 API key：请用 --key 传，或设环境变量 WTOOL_LLM_KEY"));
+    }
+    if !use_gtx && cfg.llm_base_url.trim().is_empty() {
+        return Err(Error::new("没给接口基址（--base）"));
+    }
+    if !use_gtx && cfg.llm_model.trim().is_empty() {
+        return Err(Error::new("没给模型名（--model）"));
+    }
+
+    let corpus = corpus::load(Path::new(corpus_path))?;
+    let out = Path::new(out_path);
+
+    // 输出文件开工前就认格式，别等翻了半天才炸：
+    //  - 已存在但不是 wtool 能读写的格式（含 MTool 的只读 JSON）→ 现在就说清楚，
+    //    省得一批都翻完了才报「不是 UTF-8」，白烧 API 又让用户以为坏了一半。
+    //  - 已存在且是 wtool 自身格式 → 当断点续传集，继续翻缺的那部分。
+    //  - 不存在 → 首次运行，直接新建。
+    if out.exists() {
+        match DictFormat::sniff(out) {
+            Ok(DictFormat::MtoolJson) => {
+                return Err(Error::new(format!(
+                    "{} 是 MTool 词典（只读格式），wtool 不会往里写。\n\
+                     请给 wtool 自己的输出路径，例如一个新文件 `dict.tsv` 或 `dict.json`。",
+                    out.display()
+                )));
+            }
+            Ok(_) => {} // wtool 自身格式，可续传。
+            Err(e) => return Err(e),
+        }
+    }
+
+    // 已有译文 = 断点续传集：这文件里翻过的原文，这次不再翻。
+    let merged_init: std::collections::BTreeMap<String, String> = if out.exists() {
+        wtool::read_tsv(out)?
+    } else {
+        std::collections::BTreeMap::new()
+    };
+    let resume_has = |src: &str| merged_init.contains_key(src);
+
+    // 按配置挑后端。gtx 白嫖零配置；llm 把 base/model/key 三件套带进实现。
+    let backend: Box<dyn translate::TranslateBackend> = if use_gtx {
+        Box::new(translate::gtx::Backend::new())
+    } else {
+        Box::new(translate::openai::Backend {
+            base_url: cfg.llm_base_url.clone(),
+            model: cfg.llm_model.clone(),
+            api_key: cfg.llm_api_key.clone(),
+        })
+    };
+
+    let mut report = |msg: &str| sink.say(msg.to_string());
+
+    // 每批把「盘上已有的 ∪ 新翻的」整体写回 out。死在批与批之间，前面的译文
+    // 已落盘，重跑时被 resume 跳过 —— 断点续传就接在这。每次从盘上重读而不是
+    // 捕获可变状态，是为了不和上面的 resume 借冲突。
+    let mut flush = |dict: &std::collections::BTreeMap<String, String>| {
+        let mut snapshot: std::collections::BTreeMap<String, String> =
+            if out.exists() { wtool::read_tsv(out)? } else { Default::default() };
+        for (k, v) in dict {
+            if !v.is_empty() {
+                snapshot.insert(k.clone(), v.clone());
+            }
+        }
+        wtool::write_tsv(out, &snapshot)
+            .map_err(|e| Error::new(format!("写翻译文件失败：{e}")))?;
+        Ok::<(), Error>(())
+    };
+
+    let dict = translate::translate(
+        &corpus,
+        backend.as_ref(),
+        cfg.llm_batch.max(1),
+        &resume_has,
+        &mut report,
+        &mut flush,
+    )?;
+
+    // 累计条数 = 盘上现在的（本次已写进去了）。
+    let total = if out.exists() { wtool::read_tsv(out)?.len() } else { dict.len() };
+    Ok(format!(
+        "本轮翻了 {} 条，词典累计 {} 条，已写进 {}",
+        dict.len(),
+        total,
+        out.display()
+    ))
+}
+
+/// 采集模式的主循环：跟翻译 loop 同构（注入 → 监听 → poll），差别只在收到
+/// `Text` / `Terms` 时往语料里收，**不回写译文**（`apply_terms` 回空表）。
+///
+/// 让玩家正常玩一遍，动态料（脚本拼的消息、`\v[n]` 展开后的真话）就落进语料了。
+fn run_collecting(sink: &dyn Reporter, stop_rx: Receiver<()>) -> Result<()> {
+    let cfg = config();
+    let game_dir = cfg.game_dir.trim();
+    let corpus_path = cfg.corpus_path.trim();
+
+    if game_dir.is_empty() {
+        return Err(Error::new("还没填游戏目录"));
+    }
+    if corpus_path.is_empty() {
+        return Err(Error::new("还没填语料文件路径（--corpus）"));
+    }
+
+    let kind = get_engine_type(Path::new(game_dir));
+    sink.say(format!("检测到引擎：{}", kind.name()));
+    if kind == EngineType::Unknown {
+        return Err(Error::new("这个目录既不像 MZ 也不像 MV，游戏目录是不是填错了？"));
+    }
+
+    let mut collector = online::Collector::open(Path::new(corpus_path).to_path_buf())?;
+    sink.say(format!("已有语料 {}", collector.stats()));
+
+    // 注入方式和翻译模式同一套：桥照常把原文推上来，只是 wtool 不回译文。
+    let methods = inject::mechanisms(kind);
+    let mut injected = false;
+    for method in &methods {
+        let report = method.probe(Path::new(game_dir));
+        if report.state == State::NotApplicable {
+            sink.say(format!("{}：{}", method.name(), report.detail));
+            continue;
+        }
+        sink.say(format!("注入方式：{}（{}）", method.name(), report.detail));
+        for line in method.install(Path::new(game_dir))? {
+            sink.say(line);
+        }
+        injected = true;
+        break;
+    }
+    if !injected {
+        return Err(Error::new(format!(
+            "{}（{}）上还没有可用的注入方式",
+            kind.name(),
+            kind.runtime().name()
+        )));
+    }
+
+    let link = bind_with_retry(PORT, Duration::from_secs(1))?;
+    sink.say(format!("正在监听 127.0.0.1:{PORT}，请启动游戏并正常游玩（采集模式）"));
+    let mut engine = MzEngine::new(link);
+    let mut last_save = Instant::now();
+
+    loop {
+        match stop_rx.recv_timeout(TICK) {
+            Err(RecvTimeoutError::Timeout) => {}
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                let n = collector.save()?;
+                sink.say(format!("采集结束，{}，写进 {n} 条", collector.stats()));
+                return Ok(());
+            }
+        }
+
+        let Some(ev) = engine.poll()? else {
+            continue;
+        };
+        match ev {
+            Event::Attached => {
+                sink.say("游戏已连上（采集模式）".to_string());
+                // 开局可能已经显示着对话框，补一次当前原文。
+                engine.refresh()?;
+            }
+            Event::Text(d) => {
+                collector.on_text(&d.text);
+                sink.say(format!("已收段落 #{}：{}", d.seq, brief(&d.text)));
+            }
+            Event::Terms { label, loose, texts } => {
+                collector.on_terms(&label, loose, &texts);
+                // 回空表：游戏侧替换 0 条，画面保持原文 —— 这就是「只攒料不翻」。
+                engine.apply_terms(&[])?;
+                sink.say(format!("{label} 收到 {} 条原文", texts.len()));
+            }
+            Event::Closed { .. } => {}
+        }
+
+        // 定时落盘：玩到一半被强杀，也不至于丢掉已经玩到的料。
+        if last_save.elapsed() > Duration::from_secs(2) {
+            let _ = collector.save();
+            last_save = Instant::now();
         }
     }
 }

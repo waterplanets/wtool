@@ -191,4 +191,12 @@ pub trait Engine: Send {
     /// 和 `apply` 分开是因为语义不同：`apply` 写的是「屏幕上正显示的这段话」，
     /// 靠 `seq` 认门；这里写的是「长期有效的一张小表」，和 `seq` 无关。
     fn apply_terms(&mut self, map: &[(String, String)]) -> Result<()>;
+
+    /// 设置游戏主字体。空串 = 恢复游戏原字体（不替换）。
+    ///
+    /// 独立于词表翻译：它改的是 `Game_System.prototype.mainFontFace`，
+    /// 让游戏把主字体整体换成用户选的系统中文字体，避免自带的日文字体
+    /// 在简体字的码位上空有占位、画出来一片空白。业务层在 `Attached`
+    /// 事件连上游戏时调用一次，字体跟任务走。
+    fn set_font(&mut self, font: &str) -> Result<()>;
 }
