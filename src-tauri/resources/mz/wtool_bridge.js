@@ -327,6 +327,32 @@
         return text;
     }
 
+    // 剥开 `"外层引号"对`，返回引号里的裸内容。尾部允许跟一串控制码
+    // （`\t`、`\x[アイテム入手]` 之类），它们原样跟着 tail 返回。
+    // 像「"竜のうろこ"\tx[アイテム入手]」这种物品入手横幅，裸内容就是物品名
+    // `竜のうろこ`，而词典里常有这个裸 key 却没有整条带引号的 key —— 这是
+    // 给「整行查不中」留的最后一退。剥不动（没有闭合引号对、或引号外还有
+    // 非控制码字符）就返回 null，调用方原样保留该行，宁可漏翻也别拆错。
+    //   返回 { inner: 引号里的字样（去掉了 JSON 转义）, tail: 引号之后原样 },
+    //   或 null。
+    function stripWrapper(s) {
+        var i = s.indexOf('"');
+        if (i !== 0) return null;
+        // 找与开头引号配对的结尾引号：从尾往前找第一个 `"`。
+        var j = s.lastIndexOf('"');
+        if (j <= 0) return null;
+        var inner = s.slice(i + 1, j);
+        var tail = s.slice(j + 1);
+        // 引号之间必须还剩字（空名没意义），且尾部只能剩控制码。
+        // 控制码形如 \t、\x[アイテム入手]、\i[127]：一个 \<字母>，后面
+        // 可选带一对 [...]（里边什么都能有，日文也算）。
+        if (!inner) return null;
+        if (!/^(\\[A-Za-z]+(?:\[[^\]]*\])?)*$/.test(tail)) return null;
+        // 引号内的字可能是 JSON 转义过的（\"、\\），摊回真实可见字符再去查表。
+        var decoded = inner.replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+        return { inner: decoded, tail: tail };
+    }
+
     function onOpen() {
         // 先把 \v[n] 展开再摊平：展开后的才是玩家真正看到的原文，
         // 也才是词典里 key 的样子。不展开就整段查不中。
@@ -359,8 +385,19 @@
             var out = lines.slice();
             var any = false;
             for (var i = 0; i < out.length; i++) {
-                if (dict[out[i]]) {
-                    out[i] = dict[out[i]];
+                var l = out[i];
+                if (dict[l]) {
+                    out[i] = dict[l];
+                    any = true;
+                    continue;
+                }
+                // 整行没翻中：剥掉外层引号 + 尾部控制码，按裸内容再查一次。
+                // 「"竜のうろこ"\tx[アイテム入手]」这类入手横幅就是这种 ——
+                // 词典里可能有裸名 key（竜のうろこ）而没有整条带码的 key，
+                // 这一退才能把横幅里的名字换成中文。
+                var w = stripWrapper(l);
+                if (w && dict[w.inner]) {
+                    out[i] = '"' + dict[w.inner] + '"' + w.tail;
                     any = true;
                 }
             }

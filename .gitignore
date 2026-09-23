@@ -27,3 +27,4 @@ dist-ssr
 # wtool generated test artifacts
 src-tauri/.probe_corpus/
 src-tauri/probe_translate/
+.probe_rgss3

@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use crate::corpus::plugins::{extract_config, Extractor};
 use crate::corpus::{Corpus, Granularity};
 use crate::error::Result;
 
@@ -114,6 +115,11 @@ fn read_db_texts(data: &Path, c: &mut Corpus) {
                     take_db_string(c, s);
                 }
             }
+            // note 字段：MZ 里常有**会上屏的短文案**（物品/技能/状态/敌人注释）。
+            // 纯 ASCII 的 `<插件标签>`/注释会被 `is_worthy` 过滤掉，不会大量进语料。
+            if let Some(s) = obj.get("note").and_then(Value::as_str) {
+                take_db_string(c, s);
+            }
         }
     }
 
@@ -124,7 +130,17 @@ fn read_db_texts(data: &Path, c: &mut Corpus) {
     let Some(sys) = v.as_object() else { return };
 
     if let Some(terms) = sys.get("terms").and_then(Value::as_object) {
-        for group in ["basic", "commands", "params", "messages"] {
+        for group in [
+            "basic",
+            "commands",
+            "params",
+            "messages",
+            "skillTypes",
+            "equipTypes",
+            "armorTypes",
+            "weaponTypes",
+            "elements",
+        ] {
             take_value(terms.get(group), c);
         }
     }
@@ -133,6 +149,12 @@ fn read_db_texts(data: &Path, c: &mut Corpus) {
             for s in a.iter().filter_map(Value::as_str) {
                 take_db_string(c, s);
             }
+        }
+    }
+    // 属性（elements）名也常是会上屏的字：火/冰/雷/聖…
+    if let Some(a) = sys.get("elements").and_then(Value::as_array) {
+        for s in a.iter().filter_map(Value::as_str) {
+            take_db_string(c, s);
         }
     }
     if let Some(s) = sys.get("gameTitle").and_then(Value::as_str) {
@@ -177,8 +199,16 @@ fn read_event_texts(data: &Path, c: &mut Corpus) {
         if let Some(name) = v.get("displayName").and_then(Value::as_str) {
             c.push(Granularity::Line, name);
         }
+        // 地图 note：有时藏着会上屏的区域说明一类短文案。
+        if let Some(s) = v.get("note").and_then(Value::as_str) {
+            take_db_string(c, s);
+        }
         if let Some(events) = v.get("events").and_then(Value::as_array) {
             for ev in events {
+                // 事件名：名字标记插件/显示事件名的场景会用到（纯 ASCII 的 EV001 被过滤）。
+                if let Some(name) = ev.get("name").and_then(Value::as_str) {
+                    c.push(Granularity::Line, name);
+                }
                 let Some(pages) = ev.get("pages").and_then(Value::as_array) else { continue };
                 for page in pages {
                     take_list(page.get("list").and_then(Value::as_array), c);
@@ -324,98 +354,20 @@ fn walk_unique(v: &Value, c: &mut Corpus) {
 /// 插件参数：`js/plugins.js` 里每条插件的 `parameters` 对象里的字符串。
 /// SceneCustomMenu 那类自定义菜单把菜单项文字写在这，桥要等画面真画到才收到，
 /// 这里离线一次收全。MV 在 `www/js/plugins.js`，两个都试。
+///
+/// 抽取规则集中在 `crate::corpus::plugins`——尤其「参数值本身是可执行 JS」时会把
+/// JS 外壳挡掉、只收内层字符串字面量。规则随游戏可调（黑/白名单传 `Extractor`）。
 fn read_plugins(game_dir: &Path, c: &mut Corpus) {
     for root in [game_dir.to_path_buf(), game_dir.join("www")] {
         let path = root.join("js").join("plugins.js");
         let Ok(src) = std::fs::read_to_string(&path) else { continue };
-        for s in plugin_parameter_strings(&src) {
-            c.push(Granularity::Fragment, &s);
+        let ex = Extractor::default(); // 黑白名单暂空：含日文即收，JS 外壳挡外。
+        let extracted = extract_config(&src, &ex).unwrap_or_default();
+        for s in &extracted.candidates {
+            c.push(Granularity::Fragment, s);
         }
         break; // 找到一份就够，别两个根各算一遍
     }
-}
-
-/// 从 `plugins.js` 里把所有插件参数的字符串值抠出来。
-///
-/// `plugins.js` 是 JS 不是 JSON，正规解要引解析器。RPG Maker 生成的是一个插件
-/// 一行、`parameters` 是 `{ "键": "值" }` 的扁平对象，所以这里做的是「找到
-/// `"parameters":`，往后取一个配平的 `{...}`，交给 serde_json 试着解析」——
-/// 参数大多是字面量（数字、布尔、字符串），解析得了就拿字符串，解析不了就跳过
-/// 这一份，不拖垮别家插件。
-fn plugin_parameter_strings(src: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let bytes = src.as_bytes();
-    let n = bytes.len();
-    let mut i = 0;
-    while i < n {
-        let Some(rel) = src[i..].find("\"parameters\"") else { break };
-        let at = i + rel;
-        let Some(open) = src[at..].find('{') else { break };
-        let start = at + open;
-        let Some(close) = balanced_close(src, start) else {
-            i = start + 1;
-            continue;
-        };
-        if let Ok(v) = serde_json::from_str::<Value>(&src[start..=close]) {
-            collect_strings(&v, &mut out);
-        }
-        i = close + 1;
-    }
-    out
-}
-
-/// 把 `Value` 里的所有字符串平铺进 `out`（数组/对象递归，非字符串跳过）。
-fn collect_strings(v: &Value, out: &mut Vec<String>) {
-    match v {
-        Value::String(s) => out.push(s.clone()),
-        Value::Array(a) => {
-            for y in a {
-                collect_strings(y, out);
-            }
-        }
-        Value::Object(o) => {
-            for y in o.values() {
-                collect_strings(y, out);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// 从 `start`（`{` 处）往后找配平的 `}`，跳过引号内的内容。找不到返回 `None`。
-fn balanced_close(s: &str, start: usize) -> Option<usize> {
-    let bytes = s.as_bytes();
-    let n = bytes.len();
-    let mut depth = 0i32;
-    let mut i = start;
-    while i < n {
-        if bytes[i] == b'"' {
-            i += 1;
-            while i < n {
-                if bytes[i] == b'\\' {
-                    i += 2;
-                } else if bytes[i] == b'"' {
-                    i += 1;
-                    break;
-                } else {
-                    i += 1;
-                }
-            }
-            continue;
-        }
-        match bytes[i] {
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
 }
 
 #[cfg(test)]
