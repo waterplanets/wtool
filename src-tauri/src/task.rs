@@ -15,11 +15,16 @@
 //! 这里查完一次性回过去，游戏侧直接在内存里改掉。物品/技能的名字与说明
 //! （`$dataItems` / `$dataSkills` / …）走的是同一条道，只是查法要退级。
 //!
+//! 整批那条道有它管不到的地方：开机那批清单里没有的串、自定义菜单在运行时
+//! 现拼出来的串。所以另有一条**同步查表**道（见 `engine::lookup`）：游戏侧在
+//! 画字那一刻阻塞问一句，这边另一个线程收到就查、查完立刻回，不必先画原文
+//! 再重画。两条道共用同一份词典和同一套查法。
+//!
 //! 引擎怎么说、字节怎么走都在 `engine/` 里，这里只管调度和查表。
 
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -30,6 +35,7 @@ use crate::dict::{DictFormat, mtool, wtool};
 use crate::engine::inject::{self, State};
 use crate::translate;
 use crate::engine::link::{TcpLink, PORT};
+use crate::engine::lookup;
 use crate::engine::mz::MZ::MzEngine;
 use crate::engine::{get_engine_type, resolve_game_dir, Engine, EngineType, Event};
 use crate::error::{Error, Result};
@@ -190,7 +196,9 @@ fn run(sink: &dyn Reporter, stop_rx: Receiver<()>) -> Result<()> {
     // 认不出来会在这一行报错，日志里说清是哪个文件、支持哪些格式。
     let dict_path = Path::new(dict_path);
     let fmt = DictFormat::sniff(dict_path)?;
-    let dict = mtool::Dict::from_map(fmt.load(dict_path)?);
+    // `Arc` 是为了让同步查表那条道也拿得到同一份。词典整场任务不变
+    // （换词典 = 重开任务），所以共享一份只读的就够，不用加锁。
+    let dict = Arc::new(mtool::Dict::from_map(fmt.load(dict_path)?));
     sink.say(format!("词典载入 {} 条（{}）", dict.len(), fmt.name()));
 
     // 挑一条注入方式把通道架进去。
@@ -227,6 +235,21 @@ fn run(sink: &dyn Reporter, stop_rx: Receiver<()>) -> Result<()> {
 
     let link = bind_with_retry(PORT, Duration::from_secs(1))?;
     sink.say(format!("正在监听 127.0.0.1:{PORT}，请启动游戏"));
+
+    // 同步查表另开一条通道。起不来不算失败：游戏侧会自己退回「先画原文、
+    // 等整批回话到了再重画」的老路，所以这里只提醒一声，任务继续。
+    // 这个名字前面有下划线，但它得活到 `run` 结束 —— 它一 drop，
+    // 查表线程就收工、端口才放开，否则下一轮任务会撞上「端口被占」。
+    let _lookup = match lookup::spawn(Arc::clone(&dict)) {
+        Ok(guard) => {
+            sink.say(format!("同步查表已就绪 127.0.0.1:{}", lookup::PORT));
+            Some(guard)
+        }
+        Err(e) => {
+            sink.say(format!("同步查表通道起不来（{e}），本轮退回异步重画"));
+            None
+        }
+    };
 
     // MV 与 MZ 的消息系统同名（`Window_Message.prototype.startMessage`、
     // `$gameMessage._texts`），所以这一份实现两个都能用，不按 kind 分叉。

@@ -24,6 +24,7 @@
 
 pub mod inject;
 pub mod link;
+pub mod lookup;
 pub mod mz;
 
 use std::path::{Path, PathBuf};

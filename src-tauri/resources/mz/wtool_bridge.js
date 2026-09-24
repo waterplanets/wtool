@@ -116,6 +116,216 @@
     var rxBuf = '';
 
     //-------------------------------------------------------------------------
+    // 同步查表
+    //
+    // 为什么不在这条 socket 上「问一句、等一句」：画字的是主线程（Chrome 主线程
+    // ＋ Node 集成），主线程一阻塞，socket 的 data 事件就永远不会派发 —— 自己把
+    // 自己锁死。所以查表那条连接必须**由另一个线程持有**，主线程只通过共享内存
+    // 跟它对话。
+    //
+    // 实测过的两件事（探针量完就删了）：
+    //   - 这条运行时里 worker_threads / SharedArrayBuffer / Atomics 都在，
+    //     共享内存往返真的能跑通，稳态在微秒级；
+    //   - 主线程的 Atomics.wait 被 Chrome 禁掉了（"cannot be called in this
+    //     context"），所以主线程只能忙等。
+    //
+    // 共享内存布局：全是 JS↔JS，Rust 看不到，所以字符串按 UTF-16 码元直接搬，
+    // 不做任何编码转换。
+    //   ctrl[0] 请求就绪 / ctrl[1] 应答就绪 / ctrl[2] 请求长 / ctrl[3] 应答长
+    //   ctrl[4] 唤醒代数 / ctrl[5] 连接活着 / ctrl[6] 命中 / ctrl[7] 请求号
+    //   ctrl[8] 应答号：对不上说明是上一笔迟到的应答，丢掉重等
+    //-------------------------------------------------------------------------
+
+    var LOOKUP_PORT = 17990;    // 必须和 Rust 侧 engine/lookup.rs 的 PORT 一致
+    var SYNC_TIMEOUT_MS = 50;   // 一次查表最多让游戏卡多久
+    var SYNC_MAX_FAIL = 5;      // 连续这么多次超时就认怂，本轮不再试
+    var SYNC_MAX_CHARS = 4096;  // 单条原文的码元上限
+
+    var syncCtrl = null;
+    var syncReq = null;
+    var syncResp = null;
+    var syncOn = false;
+    var syncSeq = 0;
+    var syncFail = 0;
+
+    (function startSync() {
+        var wt;
+        try {
+            wt = require('worker_threads');
+        } catch (e) {
+            return;  // 这版运行时没有：syncLookup 一直返回 null，退回攒批那条路
+        }
+        if (!wt || typeof wt.Worker !== 'function') return;
+        if (typeof SharedArrayBuffer !== 'function') return;
+        if (typeof Atomics !== 'object' || !Atomics) return;
+
+        // Worker 源码用 eval 起，不往游戏目录多丢文件（装插件时少一个要维护的
+        // 文件，重新安装的哈希比对也就只有一份）。
+        var src = [
+            'var w = require("worker_threads");',
+            'var net = require("net");',
+            'var d = w.workerData;',
+            'var ctrl = new Int32Array(d.sab, 0, 16);',
+            'var req = new Uint16Array(d.sab, 64, 4096);',
+            'var resp = new Uint16Array(d.sab, 64 + 8192, 8192);',
+            'var sock = null;',
+            'var rx = "";',
+            'var pending = 0;',
+            'var gen = Atomics.load(ctrl, 4);',
+            '',
+            '// 回不了话也必须放行：主线程正阻塞等着，放行才能让它退回异步那条路。',
+            'function release(seq) {',
+            '    Atomics.store(ctrl, 3, 0);',
+            '    Atomics.store(ctrl, 6, 0);',
+            '    Atomics.store(ctrl, 8, seq);',
+            '    Atomics.store(ctrl, 1, 1);',
+            '    Atomics.notify(ctrl, 1);',
+            '}',
+            '',
+            'function onLine(line) {',
+            '    if (!pending) return;',
+            '    var msg;',
+            '    try { msg = JSON.parse(line); } catch (e) { return; }',
+            '    if (msg.t !== "a" || msg.id !== pending) return;',
+            '    var s = (msg.hit && typeof msg.text === "string") ? msg.text : "";',
+            '    var n = s.length;',
+            '    if (n > 8192) n = 8192;',
+            '    for (var i = 0; i < n; i++) resp[i] = s.charCodeAt(i);',
+            '    var seq = pending;',
+            '    pending = 0;',
+            '    Atomics.store(ctrl, 3, n);',
+            '    Atomics.store(ctrl, 6, msg.hit ? 1 : 0);',
+            '    Atomics.store(ctrl, 8, seq);',
+            '    Atomics.store(ctrl, 1, 1);',
+            '    Atomics.notify(ctrl, 1);',
+            '}',
+            '',
+            'function connect() {',
+            '    if (sock) return;',
+            '    var s = net.createConnection({ host: "127.0.0.1", port: d.port });',
+            '    sock = s;',
+            '    s.setEncoding("utf8");',
+            '    s.setNoDelay(true);',
+            '    s.on("connect", function () { rx = ""; Atomics.store(ctrl, 5, 1); });',
+            '    s.on("data", function (chunk) {',
+            '        rx += chunk;',
+            '        var i;',
+            '        while ((i = rx.indexOf("\\n")) >= 0) {',
+            '            onLine(rx.slice(0, i));',
+            '            rx = rx.slice(i + 1);',
+            '        }',
+            '    });',
+            '    s.on("error", function () {});',
+            '    s.on("close", function () {',
+            '        Atomics.store(ctrl, 5, 0);',
+            '        if (pending) { release(pending); pending = 0; }',
+            '        if (sock === s) sock = null;',
+            '        setTimeout(connect, 1000);',
+            '    });',
+            '}',
+            '',
+            'function tick() {',
+            '    if (Atomics.load(ctrl, 0) === 1) {',
+            '        Atomics.store(ctrl, 0, 0);',
+            '        var seq = Atomics.load(ctrl, 7);',
+            '        var n = Atomics.load(ctrl, 2);',
+            '        var s = "";',
+            '        for (var i = 0; i < n; i++) s += String.fromCharCode(req[i]);',
+            '        pending = seq;',
+            '        if (sock && !sock.destroyed) {',
+            '            try {',
+            '                sock.write(JSON.stringify({ t: "q", id: seq, text: s }) + "\\n");',
+            '            } catch (e) {',
+            '                pending = 0;',
+            '                release(seq);',
+            '            }',
+            '        } else {',
+            '            pending = 0;',
+            '            release(seq);',
+            '        }',
+            '    }',
+            '    // 睡 <=1ms 等主线程叫醒（被 notify 就立刻醒），然后 setImmediate 交还',
+            '    // 一次事件循环 —— 不交还的话这条线程一直堵着，socket 的 data 回调',
+            '    // 永远跑不到。这就是本线程不能用 for(;;) 死等的原因。',
+            '    gen = Atomics.load(ctrl, 4);',
+            '    Atomics.wait(ctrl, 4, gen, 1);',
+            '    setImmediate(tick);',
+            '}',
+            '',
+            'connect();',
+            'tick();'
+        ].join('\n');
+
+        try {
+            var sab = new SharedArrayBuffer(64 + 8192 + 16384);
+            syncCtrl = new Int32Array(sab, 0, 16);
+            syncReq = new Uint16Array(sab, 64, 4096);
+            syncResp = new Uint16Array(sab, 64 + 8192, 8192);
+            // 插件一加载就起，绝不能等到第一次画字才起：那样第一笔要额外
+            // 付一次 Worker 冷启动（实测 23ms），正好卡在开场。
+            new wt.Worker(src, { eval: true, workerData: { sab: sab, port: LOOKUP_PORT } });
+            syncOn = true;
+            if (debug) console.log(LOG + '同步查表线程已起，端口 ' + LOOKUP_PORT);
+        } catch (e) {
+            syncOn = false;
+            console.warn(LOG + '同步查表起不来，退回异步重画: ' + e.message);
+        }
+    })();
+
+    function nowMs() {
+        return (typeof performance === 'object' && performance.now)
+            ? performance.now()
+            : Date.now();
+    }
+
+    /// 画字那一刻同步问一次。问着了返回译文，否则返回 null（调用方退回攒批那条路）。
+    ///
+    /// 这里会**阻塞主线程**，所以三道闸都得有：登录状态检查（连接没握上手直接
+    /// 返回）、超时（最多 `SYNC_TIMEOUT_MS`）、熔断（连续超时就整个关掉本轮）。
+    function syncLookup(text) {
+        if (!syncOn || !syncCtrl) return null;
+        if (Atomics.load(syncCtrl, 5) !== 1) return null;   // 还没连上
+        var n = text.length;
+        if (n > SYNC_MAX_CHARS) return null;
+
+        var i;
+        for (i = 0; i < n; i++) syncReq[i] = text.charCodeAt(i);
+        var seq = ++syncSeq;
+        Atomics.store(syncCtrl, 2, n);
+        Atomics.store(syncCtrl, 7, seq);
+        Atomics.store(syncCtrl, 1, 0);      // 清掉可能残留的上一次应答
+        Atomics.store(syncCtrl, 0, 1);
+        // 必须改值再 notify：Atomics 的唤醒会重新核对期望值，值没变它会接着睡。
+        Atomics.add(syncCtrl, 4, 1);
+        Atomics.notify(syncCtrl, 4);
+
+        var deadline = nowMs() + SYNC_TIMEOUT_MS;
+        for (;;) {
+            if (Atomics.load(syncCtrl, 1) === 1) {
+                if (Atomics.load(syncCtrl, 8) === seq) break;
+                Atomics.store(syncCtrl, 1, 0);   // 上一笔迟到的应答，丢掉重等
+            }
+            if (nowMs() > deadline) {
+                Atomics.store(syncCtrl, 0, 0);
+                if (++syncFail >= SYNC_MAX_FAIL) {
+                    syncOn = false;
+                    console.warn(LOG + '同步查表连续 ' + syncFail + ' 次超时，本轮退回异步重画');
+                }
+                return null;
+            }
+        }
+
+        var len = Atomics.load(syncCtrl, 3);
+        var ok = Atomics.load(syncCtrl, 6) === 1;
+        Atomics.store(syncCtrl, 1, 0);
+        syncFail = 0;
+        if (!ok || !len) return null;
+        var out = '';
+        for (i = 0; i < len; i++) out += String.fromCharCode(syncResp[i]);
+        return out;
+    }
+
+    //-------------------------------------------------------------------------
     // 传输
     //-------------------------------------------------------------------------
 
@@ -687,6 +897,18 @@
         if (debug) console.log(LOG + '数据库文本 ' + texts.length + ' 条，已问 wtool');
     }
 
+    // 这两张表的 `name` 不能改写：这个游戏拿名字当**键**。
+    //   - UskEasyScripts.js:346-362 开机时就建了 ES.dataEnemies[name] / ES.dataArmors[name]；
+    //   - CommonEvents 的「オーブを使用」更狠，是拿名字当跳板：
+    //       v1001 = $gameParty.lastItem().id            （宝珠是 armor）
+    //       v1002 = $dataArmors[v1001].name             （名字）
+    //       v1003 = ES.dataEnemies[v1002].id            （名字当键）
+    // 名字一旦成了中文，v1002 就查不到，报的正是
+    // TypeError: Cannot read property 'id' of undefined —— 访问宝珠物品时弹的那个错。
+    // 名字不写回也一点译文不丢：画字那一刻走 drawText 钩子，按日文名精确命中词典，
+    // 屏幕上照样是中文；而拼进别处的名字会由片段级那一层换掉。
+    var NAME_IS_KEY = { $dataArmors: true, $dataEnemies: true };
+
     // 把译文原地写回各条记录的字段，返回改了几条。
     // 查不到的（词典里没有的）原样留着，保持日文，好过留个空白。
     function applyDbTexts(map) {
@@ -701,6 +923,7 @@
                 if (!rec) continue;
                 for (var f = 0; f < fields.length; f++) {
                     var k = fields[f];
+                    if (k === 'name' && NAME_IS_KEY[DB_TABLES[t].name]) continue;
                     if (typeof rec[k] === 'string' && map[rec[k]]) {
                         rec[k] = map[rec[k]];
                         n++;
@@ -961,10 +1184,12 @@
     // 一条都碰不到它，所以屏幕上一直是日文。而 MTool 把整本词典灌进游戏进程，
     // 是画字那一刻同步查的，自然不受这个限制。
     //
-    // 这里补上同一条路：画之前先查 dict；dict 里没有就先记下来，攒一批问 wtool
-    // （走 loose，让 wtool 那边退级去啃整串里的片段），等回话到了让窗口重画一遍。
-    // 第一遍仍然是日文（本机 socket，通常几毫秒就回来了），第二遍起是中文 ——
-    // 和对话那套「先画原文、回写到了再重画」是同一个取舍。
+    // 这里补上同一条路：画之前先查 dict，dict 里没有就当场同步问 wtool 一句
+    // （见 syncLookup，走的是 `engine::lookup` 那条专用通道），问着了这一遍就是
+    // 中文，不用重画、也不挑窗口有没有 refresh()。
+    // 同步这条道问不着（wtool 没起、词典里真没有、超时熔断）才退回老路：先记下来
+    // 攒一批问（走 loose，让 wtool 那边退级去啃整串里的片段），等回话到了重画一遍 ——
+    // 那条路第一遍是日文、第二遍起才是中文。
     //
     // 只挂 Window_Base 的 drawText/drawTextEx，**不挂 Bitmap.drawText**：逐字绘制
     // 最终落在 contents.drawText（Bitmap 上的），那会儿手里只有一个字符，拿单字
@@ -1004,11 +1229,23 @@
         if (debug) console.log(LOG + '窗口文本 ' + texts.length + ' 条，已问 wtool');
     }
 
-    // 画之前把整串换掉。dict 里有就换，没有就原样返回（同时记下来去问）。
+    // 画之前把整串换掉。dict 里有就换，没有就**当场同步问一次**（见 syncLookup），
+    // 问着了直接就是译文 —— 不会先画一遍日文再重画，也不挑窗口有没有 refresh()。
+    // 问不着（wtool 没起、词典里真没有、超时、熔断）才退回攒批那条老路。
     function translateDrawn(text) {
         if (typeof text !== 'string' || !text) return text;
         var hit = dict[text];
         if (hit) return hit;
+        if (worthAsking(text)) {
+            hit = syncLookup(text);
+            if (hit) {
+                // 记进 dict，同一串之后就直接命中，不再走通道；译文也记进
+                // translated —— worthAsking 靠它挡住「拿中文再翻一遍」。
+                dict[text] = hit;
+                translated[hit] = true;
+                return hit;
+            }
+        }
         learnDrawn(text);
         return text;
     }
@@ -1040,6 +1277,59 @@
     var _winDrawTextEx = Window_Base.prototype.drawTextEx;
     Window_Base.prototype.drawTextEx = function (text, x, y, width) {
         return _winDrawTextEx.call(this, translateDrawn(text), x, y, width);
+    };
+
+    //-------------------------------------------------------------------------
+    // 展开之后的文本：`\tx[...]`、`\js[...]` 写出来的日文
+    //-------------------------------------------------------------------------
+    //
+    // 上面那两个钩子拿到的是**控制码串**，比如技能 290 的说明栏里写的是
+    //   `\js[sin_drain]\n\js[sin_drain2]`
+    // 这东西词典里当然没有（MTool 的 TrsData.bin 也没有）。展开发生在
+    //   Window_Base.createTextState → convertEscapeCharacters
+    //     → PluginCommonBase 覆写的那一层 → TextScriptBase 的 /\x1bJS\[(.+?)]/ 替换
+    // 也就是**在上面两个钩子更靠里的地方**：展开出来的日文（这句就是
+    // 「相手の命を奪い尽くし我が物とする悪魔の業」）再被逐块画出去，从来不经我们的手，
+    // 所以这条技能说明一直是日文。这里在展开之后再看一眼 —— 展开出来的才是玩家眼里的原文。
+    //
+    // 查表要按行来：展开结果可能多行（一句一行），整串查不中，逐行才有粒度。
+    // 查出来的键用的是原文写法（`\C[2]` 这种），而这一层的文本已经过了
+    // convertEscapeCharacters（`\` 都成了 \x1b 0x1b，`\\` 收成了 `\`），所以
+    // 查之前换回去、写回之后再换过来（toTextState）—— 这都是引擎自己那两条规则的逆。
+    function toLookupKey(s) {
+        return s.indexOf('\x1b') < 0 ? s : s.replace(/\x1b/g, '\\');
+    }
+
+    function toTextState(s) {
+        if (s.indexOf('\\') < 0) return s;
+        return s.replace(/\\\\/g, '\u0000').replace(/\\/g, '\x1b').replace(/\u0000/g, '\\');
+    }
+
+    function translateExpanded(text) {
+        var lines = text.split('\n');
+        var changed = false;
+        for (var i = 0; i < lines.length; i++) {
+            if (!lines[i]) continue;
+            var key = toLookupKey(lines[i]);
+            // 走 translateDrawn 而不是直接查：命中会记进 dict，问过的会进 askedDrawn，
+            // 同一行重画多少次都不会再问一遍（问不着的那种是 50ms 一次的代价）。
+            var hit = translateDrawn(key);
+            if (hit === key) continue;
+            lines[i] = toTextState(hit);
+            changed = true;
+        }
+        return changed ? lines.join('\n') : text;
+    }
+
+    var _createTextState = Window_Base.prototype.createTextState;
+    Window_Base.prototype.createTextState = function (text, x, y, width) {
+        var st = _createTextState.apply(this, arguments);
+        // calcTextHeight 已经按原文算过了：这里只换行内容、不动行数，高度不受影响。
+        if (st && typeof st.text === 'string' && st.text) {
+            var t = translateExpanded(st.text);
+            if (t !== st.text) st.text = t;
+        }
+        return st;
     };
 
     // 这两张表都是数据库载入时才有的（$dataSystem 和 $dataItems 一起载入），

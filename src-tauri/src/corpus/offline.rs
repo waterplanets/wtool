@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::corpus::plugins::{extract_config, Extractor};
+use crate::corpus::plugins::{extract_config, extract_string_literals, Extractor};
 use crate::corpus::{Corpus, Granularity};
 use crate::error::Result;
 
@@ -99,8 +99,17 @@ fn load_data(path: &Path) -> Option<Value> {
     serde_json::from_str(&text).ok()
 }
 
-/// 一张表的记录数组：`value[key]` 若是数组就直接用，否则是空。
+/// 一张表的记录数组。
+///
+/// 两种形状都认：
+/// - `{"items": [ … ]}` —— MZ/MV 默认；
+/// - **裸数组** `[null, { … }, …]` —— 有些游戏直接把 `$dataItems` 序列化成数组
+///   （`SUCCUBUS DESIRE` 整份 `data/*.json` 都是这个形状）。只认前一种的话，
+///   这类游戏的**每一张数据库表都会被静默跳过**，一条都收不到。
 fn rows<'a>(v: &'a Value, key: &str) -> &'a [Value] {
+    if let Value::Array(a) = v {
+        return a.as_slice();
+    }
     v.get(key).and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[])
 }
 
@@ -351,22 +360,68 @@ fn walk_unique(v: &Value, c: &mut Corpus) {
     }
 }
 
-/// 插件参数：`js/plugins.js` 里每条插件的 `parameters` 对象里的字符串。
-/// SceneCustomMenu 那类自定义菜单把菜单项文字写在这，桥要等画面真画到才收到，
-/// 这里离线一次收全。MV 在 `www/js/plugins.js`，两个都试。
+/// 插件文本：`js/plugins.js` 的参数 + `js/plugins/*.js` 的源码字面量。
 ///
-/// 抽取规则集中在 `crate::corpus::plugins`——尤其「参数值本身是可执行 JS」时会把
-/// JS 外壳挡掉、只收内层字符串字面量。规则随游戏可调（黑/白名单传 `Extractor`）。
+/// 两处都要收，缺一个就会整批漏文本：
+///
+/// - `plugins.js` 是插件**清单 + 参数**，SceneCustomMenu 那类自定义菜单把菜单项
+///   文字写在参数里（`Scene1 → "\I[188]手帳"`），桥要等画面真画到才收到。
+/// - `js/plugins/*.js` 是插件**源码**，游戏常把大段文案硬编码在这儿。本游戏
+///   （サキュバスアカデミア）的 177 个 `C_*.js` 就是每个角色的数据，描述成
+///   `shortDescription: ['傲慢な猫が変化したマドロミ。', …]` 这样的字符串数组 ——
+///   `plugins.js` 里对应的 `parameters` 是空的 `{}`，光看清单一条也收不到。
+///
+/// MV 在 `www/js/`，MZ 在 `js/`，两个根都试，认第一个有 `plugins.js` 的。
 fn read_plugins(game_dir: &Path, c: &mut Corpus) {
-    for root in [game_dir.to_path_buf(), game_dir.join("www")] {
-        let path = root.join("js").join("plugins.js");
-        let Ok(src) = std::fs::read_to_string(&path) else { continue };
+    let Some(root) = [game_dir.to_path_buf(), game_dir.join("www")]
+        .into_iter()
+        .find(|r| r.join("js").join("plugins.js").is_file())
+    else {
+        return;
+    };
+
+    // 1) 清单参数。抽取规则集中在 `crate::corpus::plugins`——尤其「参数值本身是可执行
+    //    JS」时会把 JS 外壳挡掉、只收内层字符串字面量。
+    if let Ok(src) = std::fs::read_to_string(root.join("js").join("plugins.js")) {
         let ex = Extractor::default(); // 黑白名单暂空：含日文即收，JS 外壳挡外。
         let extracted = extract_config(&src, &ex).unwrap_or_default();
         for s in &extracted.candidates {
             c.push(Granularity::Fragment, s);
         }
-        break; // 找到一份就够，别两个根各算一遍
+    }
+
+    // 2) 源码字面量。
+    read_plugin_sources(&root.join("js").join("plugins"), c);
+
+    // 3) 补丁/模组脚本。MV 游戏常把新增文案写在 `patch/`、`mod/` 下 —— 它们不在
+    //    `js/` 里、也不在 `plugins.js` 清单里，靠插件运行时按文件名加载，
+    //    前面两步一条也碰不到。目录不存在就自动跳过。
+    for extra in ["patch", "mod"] {
+        read_plugin_sources(&root.join(extra), c);
+    }
+}
+
+/// 扫一个目录下的 `*.js`，抽出含日文的字符串字面量。
+///
+/// 按**单行**收：这些文案是数组里的一个个元素，游戏拼起来画成多行块，而
+/// `Dict::translate` 整段查不到会退到逐行 exact，按行收就够。
+fn read_plugin_sources(dir: &Path, c: &mut Corpus) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let path = e.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("js") {
+            continue;
+        }
+        // 桥自己的源码不扫：里头是 wtool 的日志文案，收了只会污染语料。
+        if path.file_name().and_then(|n| n.to_str()) == Some("wtool_bridge.js") {
+            continue;
+        }
+        let Ok(src) = std::fs::read_to_string(&path) else { continue };
+        for s in extract_string_literals(&src) {
+            c.push(Granularity::Line, &s);
+        }
     }
 }
 

@@ -10,9 +10,11 @@
 //! 这种值的字符串**内容是一段可执行 JS**，不能整段当词条（整段喂模型/回写替换都会
 //! 让插件 `eval` 崩）。真正的文案藏在 JS 的**字符串字面量**里（`return "…"`）。
 //!
-//! 本模块只负责从「插件参数里抠出候选文本」，是 `offline.rs` 的插件采集解耦出去的
-//! 一块。**不同游戏的插件写法可能不同**，这里给一个保守的默认实现 + 可配置的
-//! 黑/白名单，遇到特殊游戏单独调这里的规则即可，不影响其它采集。
+//! 本模块负责从「插件里的文本」抠出候选，是 `offline.rs` 的插件采集解耦出去的一块。
+//! 两个来源：`js/plugins.js` 的**参数**（[`extract_config`]），和 `js/plugins/*.js`
+//! 的**源码字面量**（[`extract_string_literals`]，游戏常把角色/敌人文案硬编码在
+//! 这些文件里）。**不同游戏的插件写法可能不同**，这里给一个保守的默认实现 +
+//! 可配置的黑/白名单，遇到特殊游戏单独调这里的规则即可，不影响其它采集。
 //!
 //! 两部分解析用同一种「跳过引号、数括号配平」的手写扫描（这是万能法，不依赖某个
 //! 具体引擎，所以对 MV / MZ、对新旧引擎版本都稳）。
@@ -63,19 +65,45 @@ fn looks_like_js(s: &str) -> bool {
 /// 返回值里我们只留含日文的（那些才是要翻的字），余下的（`"\\\\c[14]"`、空串、
 /// 纯 ASCII 等）丢弃。这是「动态 JS 块内有效文本的提取」，和 `translate` 里
 /// `mask` 的思路相反但成型独立：这里要剥的是引号，那边要保的只有控制码。
-fn extract_string_literals(js: &str) -> Vec<String> {
+///
+/// 两种引号 + 反引号都认：`plugins.js` 里的参数值都是双引号，插件**源文件**
+/// （`js/plugins/C_*.js` 那批）清一色单引号，而 `patch/`、`mod/` 里的补丁脚本
+/// 还常用模板串（`` `チュートリアル中です\n…` ``）。
+pub(crate) fn extract_string_literals(js: &str) -> Vec<String> {
     let bytes = js.as_bytes();
     let n = bytes.len();
     let mut out = Vec::new();
     let mut i = 0;
     while i < n {
-        if bytes[i] != b'"' {
+        // 跳过注释。注释里的撇号（`// don't` 这种）会开一个假字符串，一路吞到
+        // 下一个引号，把大半段代码当文案收进来 —— 插件源码里垃圾条目的主因。
+        if bytes[i] == b'/' && i + 1 < n {
+            if bytes[i + 1] == b'/' {
+                i += 2;
+                while i < n && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            if bytes[i + 1] == b'*' {
+                i += 2;
+                while i + 1 < n && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(n);
+                continue;
+            }
+        }
+        let quote = bytes[i];
+        if quote != b'"' && quote != b'\'' && quote != b'`' {
             i += 1;
             continue;
         }
         // 读到引号开头，往后解一个字符串字面量。
         i += 1;
-        let mut buf = String::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut closed = false;
+        let mut raw_nl = false;
         while i < n {
             let c = bytes[i];
             if c == b'\\' {
@@ -83,36 +111,55 @@ fn extract_string_literals(js: &str) -> Vec<String> {
                 if i + 1 < n {
                     let e = bytes[i + 1];
                     let replaced = match e {
-                        b'n' => Some('\n'),
-                        b't' => Some('\t'),
-                        b'r' => Some('\r'),
-                        b'0' => Some('\0'),
-                        b'\\' => Some('\\'),
-                        b'"' => Some('"'),
+                        b'n' => Some(b'\n'),
+                        b't' => Some(b'\t'),
+                        b'r' => Some(b'\r'),
+                        b'0' => Some(b'\0'),
+                        b'\\' => Some(b'\\'),
+                        b'"' => Some(b'"'),
+                        b'\'' => Some(b'\''),
                         _ => None,
                     };
                     match replaced {
-                        Some(ch) => buf.push(ch),
+                        Some(b) => buf.push(b),
                         None => {
-                            buf.push('\\');
-                            buf.push(e as char);
+                            buf.push(b'\\');
+                            buf.push(e);
                         }
                     }
                     i += 2;
                 } else {
                     i += 1;
                 }
-            } else if c == b'"' {
+            } else if c == quote {
                 i += 1;
+                closed = true;
                 break; // 字符串结束
             } else {
-                buf.push(c as char);
+                // 单/双引号串里出现**裸换行**是 JS 语法错误，只可能是引号配错了。
+                if c == b'\n' || c == b'\r' {
+                    raw_nl = true;
+                }
+                buf.push(c);
                 i += 1;
             }
         }
+        // 引号没闭合 = 这根本不是字符串，是别处的撇号（正则、被截断的代码）。
+        // 这种「串」一吞就是大半段代码，丢掉比收进来安全。
+        if !closed {
+            continue;
+        }
+        // 同上：`'…'`/`"…"` 里不可能有裸换行，有就是配错了（模板串可以有）。
+        if raw_nl && quote != b'`' {
+            continue;
+        }
+        // 到这儿才把字节转成字符串：**中途不能 `byte as char`**，那会把一个 UTF-8
+        // 多字节序列拆成一串 Latin-1 字符（`相手` 变成 `ç›¸æ‰‹`），`has_japanese`
+        // 于是全判假，JS 函数体里的字面量一条都收不到。保留字节、出引号再解码。
+        let s = String::from_utf8_lossy(&buf);
         // 只收含日文、且非空有实际内容的。
-        if has_japanese(&buf) {
-            out.push(buf);
+        if has_japanese(&s) {
+            out.push(s.into_owned());
         }
     }
     out
@@ -294,6 +341,21 @@ mod tests {
         assert!(e.shell_skipped >= 1);
     }
 
+    /// 插件**源文件**里的字面量：单引号（`C_*.js` 的文案数组）、反引号
+    /// （`patch/*.js` 的模板串）都要能抽出来。
+    #[test]
+    fn source_literals_handle_single_quote_and_backtick() {
+        let src = "var X = {\n  shortDescription: [\n    '傲慢な猫が変化したマドロミ。',\n    '飼われていたころから人間を下僕と見ていたが、',\n  ],\n};\nvar y = `チュートリアル中です`;\nvar z = 'OK';\nvar broken = it's fine;\n";
+        let got = extract_string_literals(src);
+        assert!(got.contains(&"傲慢な猫が変化したマドロミ。".to_string()));
+        assert!(got.contains(&"飼われていたころから人間を下僕と見ていたが、".to_string()));
+        assert!(got.contains(&"チュートリアル中です".to_string()));
+        // 纯 ASCII 的照旧丢弃。
+        assert!(!got.contains(&"OK".to_string()));
+        // 没闭合的撇号不能把后面一大段代码吞成一个「字符串」。
+        assert!(!got.iter().any(|s| s.contains("var ")));
+    }
+
     #[test]
     fn plain_text_stays_whole() {
         let src = r#"var $plugins=[{"name":"SceneCustomMenu","status":true,"parameters":{"Scene1":"\\I[188]手帳","Scene2":"強化メニュー"}}];"#;
@@ -306,9 +368,9 @@ mod tests {
     #[test]
     fn blacklist_drops_matching() {
         let src = r#"var $plugins=[{"name":"X","status":true,"parameters":{"Token":"\\V[1]","Keep":"ここは残す"}}];"#;
-        let mut ex = Extractor::default();
-        ex.blacklist.push("Token".to_string());
-        let e = extract_config(src, &ex()).unwrap();
+        let mut cfg = Extractor::default();
+        cfg.blacklist.push("Token".to_string());
+        let e = extract_config(src, &cfg).unwrap();
         assert!(e.candidates.contains(&"ここは残す".to_string()));
         assert!(!e.candidates.contains(&"\\V[1]".to_string()));
     }
@@ -316,9 +378,9 @@ mod tests {
     #[test]
     fn whitelist_restricts_by_id() {
         let src = r#"var $plugins=[{"name":"X","status":true,"parameters":[{"Id":"A","Text":"甲"},{"Id":"B","Text":"乙"}]}];"#;
-        let mut ex = Extractor::default();
-        ex.whitelist.push("B".to_string());
-        let e = extract_config(src, &ex()).unwrap();
+        let mut cfg = Extractor::default();
+        cfg.whitelist.push("B".to_string());
+        let e = extract_config(src, &cfg).unwrap();
         assert!(!e.candidates.contains(&"甲".to_string()));
         assert!(e.candidates.contains(&"乙".to_string()));
     }
