@@ -23,7 +23,7 @@ use crate::error::{Error, Result};
 /// 不用 `bundle.resources` + 运行时找路径，是因为那样光是「开发时资源在
 /// `target/debug` 里还是在 `resources/` 里」就够折腾了，而这份文件是
 /// 我们自己写的、不需要用户替换，嵌进去最省事。
-const BRIDGE_JS: &str = include_str!("../../../resources/mz/wtool_bridge.js");
+const BRIDGE_JS: &str = include_str!("../../../resources/mz_mv/wtool_bridge.js");
 
 /// 桥在 `$plugins` 里的注册名。必须和文件名一致，RPG Maker 是按名字找文件的。
 const BRIDGE_NAME: &str = "wtool_bridge";
@@ -86,7 +86,9 @@ impl Mechanism for JsPluginBridge {
         }
     }
 
-    fn install(&self, game_dir: &Path) -> Result<Vec<String>> {
+    /// 词典和字体都不走盘：词典是桥连上后由 wtool 逐条回写，字体是连上后经
+    /// 内存通道下发的，所以这两个参数这里都用不上。
+    fn install(&self, game_dir: &Path, _dict_path: &Path, _font: &str) -> Result<Vec<String>> {
         install(game_dir)
     }
 

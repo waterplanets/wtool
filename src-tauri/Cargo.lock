@@ -5357,6 +5357,7 @@ dependencies = [
 name = "wtool"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -5364,6 +5365,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

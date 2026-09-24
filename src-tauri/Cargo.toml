@@ -27,6 +27,14 @@ serde_json = "1"
 # 用的就是 reqwest）。这里显式声明并启用 blocking + json 两个 feature，直接复用，
 # 避免再引一个 HTTP 栈。翻译层的 worker 线程用阻塞客户端最直白。
 reqwest = { version = "0.12", features = ["json", "blocking"] }
+# 枚举系统已装字体（GUI 的字体菜单）。tauri 依赖树里本来就有它，这里只把
+# feature 收到用得到的两个：GDI 的 EnumFontFamiliesExW + 几个基础类型。
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi"] }
+# flate2 不是新引入的第三方 —— tauri 依赖树里本来就有它（png/image 那一路用的）。
+# 这里显式声明，用来解 `Scripts.rvdata2` 里逐段 zlib 压缩的 Ruby 源码：
+# 那份源码是 WF-RGSS 文案（图鉴说明、帮助文本）的主要载体，不解开就整段漏掉。
+# 用默认的纯 Rust 后端（miniz_oxide），不引 C 依赖。
+flate2 = "1"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

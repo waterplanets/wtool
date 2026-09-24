@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { ref, watch } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 
 /** 与 Rust 侧 model::TsSentence 一一对应 */
 interface TsSentence {
@@ -38,51 +38,114 @@ const REVERSIBLE_TEXT: Record<MethodStatus["reversible"], string> = {
   none: "只能重启游戏",
 };
 
+/** 上次填过的配置。存 localStorage，重启不用重填（纯前端，Rust 那边不掺和）。 */
+const SAVED_KEY = "wtool-config";
+const saved: Record<string, string> = (() => {
+  try {
+    return JSON.parse(localStorage.getItem(SAVED_KEY) ?? "{}");
+  } catch {
+    return {}; // 存档坏了就当没存过，不值得为此挡住界面
+  }
+})();
+
 /** GUI 上填的变量，对应 Rust 侧 task::Config */
-const gameDir = ref(
-  "D:\\myProgram\\game2\\lilisproject\\SUCCUBUS DESIRE ~リリスプロジェクト~",
+const gameDir = ref(saved.gameDir ?? "");
+const dictPath = ref(
+  saved.dictPath ?? (saved.gameDir ? `${saved.gameDir}\\TrsData.bin` : ""),
 );
-const dictPath = ref(`${gameDir.value}\\TrsData.bin`);
 
 /** 词典路径是否被手动改过。改过就不再跟着游戏目录自动改，免得覆盖用户的输入。 */
-const dictManual = ref(false);
+const dictManual = ref(Boolean(saved.dictPath));
 
-/** 目标字体。空串 = 不替换，只走桥里那层 CJK 缺字兜底。 */
-const font = ref("");
+/** 目标字体。空串 = 不指定（RGSS3 钩子用它内置的黑体，MZ 保持游戏原字体）。 */
+const font = ref(saved.font ?? "");
+
+/** 系统里装了哪些字体。菜单的候选就是它 —— WebView 自己拿不到这份清单，问 Rust。 */
+const systemFonts = ref<string[]>([]);
+
+/**
+ * 菜单里的候选：系统字体 + 「当前这个」。
+ * 上次存的字体有可能这台机器上没装（换机器、或字体被卸了），补进来免得选完变空。
+ */
+const fontOptions = computed(() => {
+  const list = systemFonts.value;
+  const cur = font.value.trim();
+  return cur && !list.includes(cur) ? [cur, ...list] : list;
+});
+
+/** 拉一次系统字体。拉不到就空表，菜单退化成「只有不指定 + 手填过的那个」。 */
+async function loadSystemFonts() {
+  try {
+    systemFonts.value = await invoke<string[]>("list_system_fonts");
+  } catch {
+    systemFonts.value = [];
+  }
+}
+
+onMounted(loadSystemFonts);
 
 /** 翻译后端。gtx = Google 网页接口（免费零配置）；llm = OpenAI 兼容接口（要 key）。 */
-const translateBackend = ref("gtx");
+const translateBackend = ref(saved.translateBackend ?? "gtx");
 
 /** 「离线翻译」页的输入：语料 → 词典 */
-const corpusPath = ref("");
-const outPath = ref("");
-const llmBaseUrl = ref("https://api.deepseek.com");
-const llmModel = ref("deepseek-chat");
+const corpusPath = ref(saved.corpusPath ?? "");
+const outPath = ref(saved.outPath ?? "");
+const llmBaseUrl = ref(saved.llmBaseUrl ?? "https://api.deepseek.com");
+const llmModel = ref(saved.llmModel ?? "deepseek-chat");
+/**
+ * API key 不存本地 —— 那是凭据，落到 localStorage 等于明文躺在磁盘上。
+ * 每次开界面重填一次。
+ */
 const llmApiKey = ref("");
-const llmBatch = ref("20");
+const llmBatch = ref(saved.llmBatch ?? "20");
 
 /** 当前激活的标签页 */
 const activeTab = ref<string>("live");
 
-/** gtx 撑的境外接口在国内直连通常不通，离线翻译页提示用户配代理。 */
-const errorHintGtx = true;
-
-/** 常见系统中文字体，给个候选；列表外的字体也能手打。 */
-const FONT_CHOICES = [
-  "Microsoft YaHei",
-  "SimHei",
-  "SimSun",
-  "KaiTi",
-  "FangSong",
-  "Microsoft JhengHei",
-  "Noto Sans CJK SC",
-  "Source Han Sans SC",
-];
+/** 有后台任务在跑：这时禁用「开始」，免得连点起好几个任务。 */
+const running = ref(false);
+/** 离线扫描（同步命令）在跑：单独一档，`running` 说的是后台任务。 */
+const scanning = ref(false);
 
 /** 游戏目录改了就顺手把词典路径带过去（MTool 的词典就放在游戏根目录）。 */
 watch(gameDir, (dir) => {
   if (!dictManual.value) dictPath.value = `${dir}\\TrsData.bin`;
 });
+
+/** 配置一改就落盘，下次开界面还在。API key 不在里面（见上面那句注释）。 */
+watch(
+  [
+    gameDir,
+    dictPath,
+    font,
+    translateBackend,
+    corpusPath,
+    outPath,
+    llmBaseUrl,
+    llmModel,
+    llmBatch,
+  ],
+  () => {
+    try {
+      localStorage.setItem(
+        SAVED_KEY,
+        JSON.stringify({
+          gameDir: gameDir.value,
+          dictPath: dictPath.value,
+          font: font.value,
+          translateBackend: translateBackend.value,
+          corpusPath: corpusPath.value,
+          outPath: outPath.value,
+          llmBaseUrl: llmBaseUrl.value,
+          llmModel: llmModel.value,
+          llmBatch: llmBatch.value,
+        }),
+      );
+    } catch {
+      // 存不下（隐私模式之类）就算了，不影响翻译。
+    }
+  },
+);
 
 /** 识别出来的引擎，光看这一行就能判断路径填得对不对 */
 const engineName = ref("");
@@ -128,8 +191,8 @@ async function pickGameDir() {
 /** 从文件管理器挑词典文件，挑完就不跟着游戏目录自动改了。 */
 async function pickDict() {
   const file = await open({
-    multiple: false,
-    filters: [{ name: "MTool 词典", extensions: ["bin", "json"] }],
+    multiple: false
+    //filters: [{ name: "MTool 词典", extensions: ["bin", "json"] }],
   });
   if (typeof file === "string") {
     dictPath.value = file;
@@ -157,6 +220,9 @@ async function installMethod(id: string) {
     const lines = await invoke<string[]>("install_injection", {
       gameDir: gameDir.value,
       id,
+      // RGSS3 这条要在装的时候把词典和字体投进游戏目录，所以顺带交过去。
+      dictPath: dictPath.value,
+      font: font.value,
     });
     logs.value.push(...lines);
   } catch (e: any) {
@@ -204,6 +270,7 @@ async function start() {
   try {
     await sendConfig();
     await invoke("start_trans");
+    running.value = true;
   } catch (e: any) {
     error.value = e?.message ?? String(e);
   }
@@ -216,6 +283,7 @@ async function startOffline() {
   try {
     await sendConfig();
     await invoke("start_translate_file");
+    running.value = true;
   } catch (e: any) {
     error.value = e?.message ?? String(e);
   }
@@ -228,6 +296,7 @@ async function startCollect() {
   try {
     await sendConfig();
     await invoke("start_collect");
+    running.value = true;
   } catch (e: any) {
     error.value = e?.message ?? String(e);
   }
@@ -236,6 +305,7 @@ async function startCollect() {
 /** 离线扫描：不开游戏直接扫目录收料，返回条数贴进日志。 */
 async function collectOffline() {
   error.value = "";
+  scanning.value = true;
   try {
     const msg = await invoke<string>("collect_offline", {
       gameDir: gameDir.value,
@@ -244,10 +314,12 @@ async function collectOffline() {
     logs.value.push(msg);
   } catch (e: any) {
     error.value = e?.message ?? String(e);
+  } finally {
+    scanning.value = false;
   }
 }
 
-/** 从文件管理器挑语料文件 */
+/** 挑一个已存在的语料文件（离线翻译页的输入）。 */
 async function pickCorpus() {
   const file = await open({
     multiple: false,
@@ -256,17 +328,40 @@ async function pickCorpus() {
   if (typeof file === "string") corpusPath.value = file;
 }
 
-/** 从文件管理器挑输出词典文件 */
+/**
+ * 指定语料**输出**文件。
+ *
+ * 这里得用 `save()` 不能用 `open()`：`open()` 只能挑已经存在的文件，
+ * 用户既没法输新文件名、也谈不上选类型。
+ */
+async function pickCorpusOut() {
+  const file = await save({
+    defaultPath: corpusPath.value || undefined,
+    filters: [{ name: "wtool 语料", extensions: ["tsv", "txt", "corpus"] }],
+  });
+  if (typeof file === "string") corpusPath.value = file;
+}
+
+/** 指定输出词典文件。同样是 `save()`，能输新文件名、能选类型。 */
 async function pickOut() {
-  const file = await open({
-    multiple: false,
-    filters: [{ name: "wtool 词典", extensions: ["txt", "tsv", "json"] }],
+  const file = await save({
+    defaultPath: outPath.value || undefined,
+    filters: [
+      { name: "wtool 词典（TSV）", extensions: ["tsv", "txt"] },
+      { name: "wtool 词典（JSON）", extensions: ["json"] },
+    ],
   });
   if (typeof file === "string") outPath.value = file;
 }
 
 async function stop() {
-  await invoke("stop_trans");
+  error.value = "";
+  try {
+    await invoke("stop_trans");
+    running.value = false;
+  } catch (e: any) {
+    error.value = e?.message ?? String(e);
+  }
 }
 
 async function load() {
@@ -316,18 +411,22 @@ async function load() {
         </label>
         <label>
           目标字体
-          <input v-model="font" list="wtool-fonts" placeholder="留空则不替换" />
-          <datalist id="wtool-fonts">
-            <option v-for="f in FONT_CHOICES" :key="f" :value="f" />
-          </datalist>
+          <select v-model="font">
+            <option value="">不指定（用默认）</option>
+            <option v-for="f in fontOptions" :key="f" :value="f">{{ f }}</option>
+          </select>
         </label>
 
-        <p class="hint">目标字体在点「开始翻译」时随配置下发给游戏；留空则只补缺字，不整体替换。</p>
+        <p class="hint">
+          列表是本机已装的字体。改动不会立刻生效：RGSS3 要重新「注入」+ 重启游戏，
+          MZ 要重新「开始翻译」再进游戏。不指定时，RGSS3 用内置的黑体，
+          MZ 保持游戏原字体。
+        </p>
         <p class="hint" v-if="engineName">检测到引擎：{{ engineName }}</p>
 
         <div class="row">
-          <button type="submit">开始翻译</button>
-          <button type="button" @click="stop">停止</button>
+          <button type="submit" :disabled="running">开始翻译</button>
+          <button type="button" :disabled="!running" @click="stop">停止</button>
         </div>
       </form>
 
@@ -385,19 +484,21 @@ async function load() {
         <label>
           语料文件
           <input v-model="corpusPath" placeholder="攒到的原文写到这里" />
-          <button type="button" @click="pickCorpus">选择文件</button>
+          <button type="button" @click="pickCorpusOut">指定输出文件</button>
         </label>
 
         <p class="hint">
           在线采集：点「开始」后启动游戏正常玩一遍，剧情/菜单原文会定时落进语料文件，玩完点「停止」保存；
-          离线扫描则不开游戏，直接扫游戏目录收料（出条数，很快）。
+          离线扫描则不开游戏，直接扫游戏目录收料（打包的游戏要先解归档，会慢一些）。
         </p>
         <p class="hint" v-if="engineName">检测到引擎：{{ engineName }}</p>
 
         <div class="row">
-          <button type="submit">开始在线采集</button>
-          <button type="button" @click="collectOffline">离线扫描</button>
-          <button type="button" @click="stop">停止</button>
+          <button type="submit" :disabled="running">开始在线采集</button>
+          <button type="button" :disabled="scanning" @click="collectOffline">
+            {{ scanning ? "扫描中…" : "离线扫描" }}
+          </button>
+          <button type="button" :disabled="!running" @click="stop">停止</button>
         </div>
       </form>
     </section>
@@ -420,7 +521,7 @@ async function load() {
         <label>
           输出词典
           <input v-model="outPath" placeholder="翻好的词典写到这里" />
-          <button type="button" @click="pickOut">选择文件</button>
+          <button type="button" @click="pickOut">指定输出文件</button>
         </label>
 
         <template v-if="translateBackend === 'llm'">
@@ -446,12 +547,13 @@ async function load() {
           语料来自「游戏内采集 / 离线扫描」；这里把语料翻成词典。
           词典可反复跑：已翻过的原文会被跳过（断点续传），越翻越全。
         </p>
-        <p class="hint" v-if="translateBackend === 'gtx' && errorHintGtx">
+        <p class="hint" v-if="translateBackend === 'gtx'">
           注意：gtx 走境外谷歌接口，国内直连可能不通，必要时配代理环境变量 HTTPS_PROXY。
         </p>
 
         <div class="row">
-          <button type="submit">开始翻译</button>
+          <button type="submit" :disabled="running">开始翻译</button>
+          <button type="button" :disabled="!running" @click="stop">停止</button>
         </div>
       </form>
     </section>
@@ -480,9 +582,9 @@ async function load() {
           </tr>
         </thead>
         <tbody>
-          <tr v-for="(value,index) in entries">
-            <td>{{ index+1 }}</td>
-            <td>{{ value.source }}</td>
+          <tr v-for="(value, index) in entries" :key="index">
+            <td>{{ index + 1 }}</td>
+            <td class="source">{{ value.source }}</td>
             <td>{{ value.target }}</td>
           </tr>
         </tbody>
@@ -549,7 +651,8 @@ th {
   margin: 0.4em 0;
 }
 
-.config input {
+.config input,
+.config select {
   width: min(70vw, 720px);
   margin-left: 0.5em;
 }
@@ -664,6 +767,7 @@ h1 {
 }
 
 input,
+select,
 button {
   border-radius: 8px;
   border: 1px solid transparent;
@@ -690,6 +794,7 @@ button:active {
 }
 
 input,
+select,
 button {
   outline: none;
 }
@@ -709,6 +814,7 @@ button {
   }
 
   input,
+  select,
   button {
     color: #ffffff;
     background-color: #0f0f0f98;

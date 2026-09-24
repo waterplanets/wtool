@@ -66,8 +66,15 @@ const SD_SKIP: &[&str] = &[
     "requestPleasureAction",
 ];
 
-/// 扫一个游戏目录，收成一份语料。
-pub fn scan(game_dir: &Path) -> Result<Corpus> {
+/// 扫一个 MV/MZ 游戏目录，收成一份语料。
+///
+/// 名字里带 `json` 是因为「去哪儿找文本」是**引擎的数据格式**决定的，
+/// 不是「游戏」决定的：MV/MZ 是明文 JSON、按字段名取，RGSS3 是 Ruby
+/// Marshal（见 [`crate::corpus::rgss3`]）。两边共用的只有 [`Corpus`]
+/// 和 [`crate::corpus::is_worthy`]，取文本这一段没得共用。
+/// 按引擎分派写在调用方（`task::collect_offline`），不放在这里 ——
+/// 否则 corpus 要反向依赖 engine。
+pub fn scan_json(game_dir: &Path) -> Result<Corpus> {
     let data = data_dir(game_dir)
         .ok_or_else(|| crate::error::Error::new("找不到游戏目录里的 data/ 文件夹，目录是不是填错了？".to_string()))?;
 
@@ -461,7 +468,7 @@ mod tests {
     fn scan_collects_event_and_db_and_terms() {
         let dir = scratch("ev");
         make_game(&dir);
-        let c = scan(&dir).unwrap();
+        let c = scan_json(&dir).unwrap();
 
         // 事件正文：单行（4 行）+ 整段（2 行 401 拼起来）
         assert!(c.flat().iter().any(|(g, s)| *g == Granularity::Whole && s == "これはテスト\n二行目です"));
@@ -490,7 +497,7 @@ mod tests {
         )
         .unwrap();
 
-        let c = scan(&dir).unwrap();
+        let c = scan_json(&dir).unwrap();
         assert!(c.flat().iter().any(|(g, s)| *g == Granularity::Fragment && s == "\\I[188]手帳"));
         assert!(c.flat().iter().any(|(g, s)| *g == Granularity::Fragment && s == "強化メニュー"));
     }
@@ -500,7 +507,7 @@ mod tests {
     fn scan_dedup_counting_works() {
         let dir = scratch("dedup");
         make_game(&dir);
-        let c = scan(&dir).unwrap();
+        let c = scan_json(&dir).unwrap();
         // 至少收进来若干条；total 是 u64，unique 是 usize，转成同型再比。
         assert!(c.unique() > 0);
         assert!(c.total() >= c.unique() as u64);

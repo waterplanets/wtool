@@ -218,8 +218,9 @@ fn run(sink: &dyn Reporter, stop_rx: Receiver<()>) -> Result<()> {
         }
 
         sink.say(format!("注入方式：{}（{}）", method.name(), report.detail));
-        // 装：写插件文件 + 在 plugins.js 里打开它。幂等，第二次起就只是读一遍确认。
-        for line in method.install(Path::new(game_dir))? {
+        // 装：写插件文件 + 在 plugins.js 里打开它（RGSS3 则是转词典 + 追加 Patch.rb）。
+        // 幂等，第二次起就只是读一遍确认。
+        for line in method.install(Path::new(game_dir), dict_path, &cfg.font)? {
             sink.say(line);
         }
         injected = true;
@@ -345,16 +346,41 @@ fn run(sink: &dyn Reporter, stop_rx: Receiver<()>) -> Result<()> {
 
 /// 扫描游戏目录、离线收一份语料并写盘，返回给人看的话。
 ///
-/// 不启动游戏、不注入 —— 纯粹读 `data/*.json` 和 `js/plugins.js`，出条数。
-/// 命令行 `--offline-collect` 走这条；GUI 的第 3 步再接管。
+/// 不启动游戏、不注入 —— 纯粹读游戏目录里的数据文件，出条数。
+/// 命令行 `--offline-collect` 和界面的采集页「离线扫描」都走这条。
+///
+/// 别当它「很快」：RGSS3 的数据打包在 `Game.rgss3a` 里（本机那个 975MB），
+/// 要先读归档再走 Ruby Marshal，慢是正常的。但**不整包解密** —— 只按文件表
+/// 定位要的那几个 `Data/*.rvdata2`，逐个 seek 读。这里是同步函数，不过 Tauri
+/// 命令跑在 worker 线程上，界面不会冻；真嫌慢再挪进后台线程（那时复用
+/// `trainning_collect` 的 `Handle` 语义）。
 pub fn collect_offline(game_dir: &str, out: &std::path::Path) -> Result<String> {
     let dir = resolve_game_dir(game_dir);
-    let c = corpus::offline::scan(&dir)?;
-    let n = corpus::save(out, &c)?;
+
+    // 「去哪儿找文本」按**引擎的数据格式**分派，不按游戏分：MV/MZ 是明文 JSON、
+    // 按字段名取，RGSS3 是 Ruby Marshal、还得先解归档。两边只共用 Corpus、
+    // 粒度、过滤和落盘格式，取文本这一段没得共用。
+    //
+    // 分派写在这里（调用方）而不写进 corpus，是为了不让 corpus 反向依赖
+    // engine —— 那会转成环。顺序也定死：先 resolve 再判类型，否则用户把
+    // 路径填到 `Game.exe` 上时判不出来。
+    let corpus = match get_engine_type(&dir) {
+        EngineType::Mz | EngineType::Mv => corpus::offline::scan_json(&dir)?,
+        EngineType::Rgss3 => corpus::rgss3::scan(&dir)?,
+        EngineType::Unknown => {
+            return Err(Error::new(format!(
+                "{} 里既没有 data/ 目录，也没有 Game.rgss3a / Data/*.rvdata2，\
+                 游戏目录是不是填错了？",
+                dir.display()
+            )))
+        }
+    };
+
+    let n = corpus::save(out, &corpus)?;
     Ok(format!(
         "{} 扫描完毕，{}，已写进 {}（去重 {n} 条）",
         dir.display(),
-        c.stats(),
+        corpus.stats(),
         out.display()
     ))
 }
@@ -366,43 +392,39 @@ pub fn collect_offline(game_dir: &str, out: &std::path::Path) -> Result<String> 
 /// 后端在配置里选：`translate_backend == "gtx"` 走免费谷歌接口（零配置），
 /// 其余值（如 `"llm"`）走 OpenAI 兼容接口（要 base/model/key）。
 pub fn translate_cli(corpus_path: &str, out_path: &str) -> Result<String> {
-    run_translate_file(&StdoutSink, corpus_path, out_path)
+    // 命令行靠 Ctrl+C 停，不需要停止通道；给一个永远不会断的接收端。
+    let (_stop_tx, stop_rx) = mpsc::channel::<()>();
+    run_translate_file(&StdoutSink, corpus_path, out_path, &stop_rx)
 }
 
 /// 离线翻译入口：起一个后台线程跑 [`run_translate_file`]，进度走 `trans-status`。
 ///
-/// 只许一个离线任务在跑：多个同时起会并发写同一个输出文件，把文件搅乱、
-/// 也会让 gtx/LLM 同时打请求触发 429。第二个点「开始」直接报错拦住。
-pub fn trainning_translate(app: &AppHandle) -> Result<()> {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static BUSY: AtomicBool = AtomicBool::new(false);
-    if BUSY.swap(true, Ordering::SeqCst) {
-        return Err(Error::new("已有离线翻译在跑，等它结束再试"));
-    }
-
+/// 返回的 `Handle` 进 `commands::CURRENT` —— 和直播翻译、在线采集**同一套停止
+/// 语义**：界面上的「停止」对三个任务是一个意思。停止在**批与批之间**生效
+/// （见 `run_translate_file` 里的 flush），本轮已翻的译文已经落盘，下次接着跑。
+pub fn trainning_translate(app: &AppHandle) -> Result<Handle> {
     let cfg = config();
     let corpus_path = cfg.corpus_path.trim().to_string();
     let out_path = cfg.out_path.trim().to_string();
     if corpus_path.is_empty() {
-        BUSY.store(false, Ordering::SeqCst);
         return Err(Error::new("还没填语料文件路径（--corpus）"));
     }
     if out_path.is_empty() {
-        BUSY.store(false, Ordering::SeqCst);
         return Err(Error::new("还没填输出词典路径"));
     }
 
     let sink = AppSink(app.clone());
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
     thread::spawn(move || {
         sink.say("开始离线翻译…".to_string());
-        let result = run_translate_file(&sink, &corpus_path, &out_path);
-        BUSY.store(false, Ordering::SeqCst);
+        let result = run_translate_file(&sink, &corpus_path, &out_path, &stop_rx);
+        // 「已停止」不是错，照实说就行，别吓人。
         match result {
             Ok(msg) => sink.say(msg),
-            Err(e) => sink.say(format!("离线翻译出错：{e}")),
+            Err(e) => sink.say(format!("离线翻译结束：{e}")),
         }
     });
-    Ok(())
+    Ok(Handle { _stop: stop_tx })
 }
 
 /// 真正的翻译主体：把语料翻成词典。CLI 与 GUI 共用一条道，`sink` 决定进度往哪说。
@@ -411,10 +433,15 @@ pub fn trainning_translate(app: &AppHandle) -> Result<()> {
 /// 文件，所以这文件可以安全地跨多次运行累积——每次只补翻缺的那部分（`resume`）。
 /// 后端在配置里选：`translate_backend == "gtx"` 走免费谷歌接口（零配置），
 /// 其余值（如 `"llm"`）走 OpenAI 兼容接口（要 base/model/key）。
+///
+/// `stop` 是「停止」通道：只**在批与批之间**看一眼，不停正在飞的那批请求 ——
+/// 那一批的译文已经在写了，硬切只会把文件写坏。所以「停止」的含义是
+/// 「本轮到此为止」：已翻的已落盘，下次接着跑。
 fn run_translate_file(
     sink: &dyn Reporter,
     corpus_path: &str,
     out_path: &str,
+    stop: &Receiver<()>,
 ) -> Result<String> {
     let cfg = config();
 
@@ -477,6 +504,14 @@ fn run_translate_file(
     // 已落盘，重跑时被 resume 跳过 —— 断点续传就接在这。每次从盘上重读而不是
     // 捕获可变状态，是为了不和上面的 resume 借冲突。
     let mut flush = |dict: &std::collections::BTreeMap<String, String>| {
+        // 批与批之间看一眼「停止」：`Ok(())` 是显式叫停，`Disconnected` 是
+        // 拿着 Handle 的那位没了（任务被顶掉）—— 两种都该收工。
+        match stop.try_recv() {
+            Ok(()) | Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(Error::new("已停止（本轮已翻的译文已落盘，下次接着跑）"))
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
         let mut snapshot: std::collections::BTreeMap<String, String> =
             if out.exists() { wtool::read_tsv(out)? } else { Default::default() };
         for (k, v) in dict {
@@ -516,6 +551,7 @@ fn run_collecting(sink: &dyn Reporter, stop_rx: Receiver<()>) -> Result<()> {
     let cfg = config();
     let game_dir = cfg.game_dir.trim();
     let corpus_path = cfg.corpus_path.trim();
+    let dict_path = cfg.dict_path.trim();
 
     if game_dir.is_empty() {
         return Err(Error::new("还没填游戏目录"));
@@ -543,7 +579,7 @@ fn run_collecting(sink: &dyn Reporter, stop_rx: Receiver<()>) -> Result<()> {
             continue;
         }
         sink.say(format!("注入方式：{}（{}）", method.name(), report.detail));
-        for line in method.install(Path::new(game_dir))? {
+        for line in method.install(Path::new(game_dir), Path::new(dict_path), &cfg.font)? {
             sink.say(line);
         }
         injected = true;

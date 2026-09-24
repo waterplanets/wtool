@@ -26,6 +26,7 @@
 pub mod offline;
 pub mod online;
 pub mod plugins;
+pub mod rgss3;
 
 use std::collections::BTreeMap;
 use std::path::Path;

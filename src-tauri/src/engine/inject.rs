@@ -11,13 +11,17 @@
 //! 所以将来接第二个共用运行时的引擎时，机制代码可以原样复用，只需要写新的
 //! `Engine` 接线 —— 这就是把这一层单拎出来的收益。
 //!
-//! 现在只有一条路：RPG Maker 的 JS 插件桥（`mz::bridge`）。
+//! 现在有两条路：
+//!
+//! - RPG Maker 的 JS 插件桥（`mz::bridge`）—— 写 `js/plugins`，跑在 NW.js 上；
+//! - RGSS3 的 NWPatch（`rgss3::patch`）—— 追加 `Patch/Patch.rb`，零注入。
 
 use std::path::Path;
 
 use serde::Serialize;
 
 use crate::engine::mz::bridge::JsPluginBridge;
+use crate::engine::rgss3::patch::Rgss3Patch;
 use crate::engine::{EngineType, Runtime};
 use crate::error::Result;
 
@@ -69,7 +73,14 @@ pub trait Mechanism {
     /// 只看磁盘就能判断的状态。**失败不许 panic**：探测是要展示给用户看的，
     /// 目录填错、文件没权限都属于「探测结果」，不是程序的异常。
     fn probe(&self, game_dir: &Path) -> Report;
-    fn install(&self, game_dir: &Path) -> Result<Vec<String>>;
+    /// 装上这条路。两个参数都是 GUI 上配的：
+    ///
+    /// - `dict_path`：词典文件。有些方式需要把它转成游戏侧能直接读的形态一并
+    ///   投进去（RGSS3 的 Patch 走这条），用不上的方式（JS 插件桥，词典走内存
+    ///   通道）忽略它即可。
+    /// - `font`：目标字体名。同样是「要在装的时候烤进游戏侧文件里」的方式才用
+    ///   得上（RGSS3 的钩子读的是磁盘上的 Ruby 源码）；空串 = 不指定，用默认。
+    fn install(&self, game_dir: &Path, dict_path: &Path, font: &str) -> Result<Vec<String>>;
     fn uninstall(&self, game_dir: &Path) -> Result<Vec<String>>;
     fn reversibility(&self) -> Reversibility;
     /// 装完要不要重启游戏才生效。
@@ -99,6 +110,16 @@ pub struct MethodStatus {
 pub fn mechanisms(kind: EngineType) -> Vec<Box<dyn Mechanism>> {
     match kind.runtime() {
         Runtime::NwJs => vec![Box::new(JsPluginBridge)],
+        // RGSS3 没有 JS 可执行，「写插件」不成立；但它有 NWPatch —— 游戏启动时
+        // 会 `File.read` + `eval` 一份松散的 `Patch/Patch.rb`。这条路是**零注入**
+        // 的：不动进程内存、不落 DLL、杀软管不着，删文件即撤销。
+        //
+        // 顺带记下另一条路的现状，省得重新摸：MTool 的 `RGSSHook.dll` 那条
+        // （`inject.exe Game.exe RGSSHook.dll`，CreateRemoteThread）方向是反的
+        // ——DLL 是服务端、监听 42800，wtool 得当客户端连它，线格式还是帧式的
+        // `[len][type]` 而非「一行一条 JSON」，和 `link::TcpLink` 的契约不兼容；
+        // 而且会被卡巴斯基拦。所以现在走 NWPatch 这条。
+        Runtime::Native => vec![Box::new(Rgss3Patch)],
         Runtime::Unknown => Vec::new(),
     }
 }
