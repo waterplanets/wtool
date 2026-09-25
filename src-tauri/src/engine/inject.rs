@@ -85,6 +85,21 @@ pub trait Mechanism {
     fn reversibility(&self) -> Reversibility;
     /// 装完要不要重启游戏才生效。
     fn restart_required(&self) -> bool;
+    /// 翻译时需不需要 wtool 常驻的运行时服务。
+    ///
+    /// JS 插件桥要走 TCP/同步查表两条内存通道，wtool 必须开着；RGSS3 的钩子
+    /// 自己从盘上读词典、在游戏进程里查表，**不需要任何服务**，装完即终态。
+    /// 前端按这个字段决定主按钮是「开始翻译（起服务）」还是「安装并完成」。
+    fn needs_server(&self) -> bool {
+        true
+    }
+    /// 安装是否在 wtool 退出后保留。
+    ///
+    /// 非持久的方式在 wtool 退出时会被 `commands::cleanup_on_exit` 还原，
+    /// 免得游戏目录里常驻着用不上的文件、每次开游戏白载一遍。
+    fn persistent(&self) -> bool {
+        false
+    }
 }
 
 /// 给前端的状态快照。
@@ -96,6 +111,10 @@ pub struct MethodStatus {
     pub detail: String,
     pub reversible: Reversibility,
     pub restart_required: bool,
+    /// 翻译是否需要 wtool 常驻服务（RGSS3 为 false，装完即终态）。
+    pub needs_server: bool,
+    /// 安装是否在 wtool 退出后保留（RGSS3 为 true）。
+    pub persistent: bool,
 }
 
 /// 按引擎给出候选注入方式，顺序即优先级。
@@ -137,6 +156,8 @@ pub fn status(kind: EngineType, game_dir: &Path) -> Vec<MethodStatus> {
                 detail: report.detail,
                 reversible: m.reversibility(),
                 restart_required: m.restart_required(),
+                needs_server: m.needs_server(),
+                persistent: m.persistent(),
             }
         })
         .collect()
@@ -145,4 +166,16 @@ pub fn status(kind: EngineType, game_dir: &Path) -> Vec<MethodStatus> {
 /// 按 id 找回一条方式，用于「取消注入」。
 pub fn find(kind: EngineType, id: &str) -> Option<Box<dyn Mechanism>> {
     mechanisms(kind).into_iter().find(|m| m.id() == id)
+}
+
+/// 这个游戏上**第一条可用的**注入方式，顺序同 [`mechanisms`]。
+///
+/// `task::run` 挑机制时走的就是这个优先级（探一遍、跳过不适用的、用第一条
+/// 能用的）。单独抽出来是给「开始翻译」那个命令**预判**用：它要在起任务之前
+/// 就知道这次会不会起常驻服务，好把结果告诉前端（RGSS3 装完即完成，MV/MZ
+/// 得保持 wtool 开着）。
+pub fn pick(kind: EngineType, game_dir: &Path) -> Option<Box<dyn Mechanism>> {
+    mechanisms(kind)
+        .into_iter()
+        .find(|m| m.probe(game_dir).state != State::NotApplicable)
 }

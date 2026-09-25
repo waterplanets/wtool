@@ -79,6 +79,65 @@ impl Granularity {
     }
 }
 
+/// 语料文件的落盘格式。
+///
+/// 两种都给，是因为语料有两种用法：TSV 一行一条、能 `git diff`、能手改，
+/// 适合人来审；JSON 带出现次数、结构清晰，适合程序读回来接着处理。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorpusFormat {
+    /// 行式文本：`#wtool-corpus 1` 头 + 每行 `W|L|F <TAB> 原文`。
+    Tsv,
+    /// JSON：`{"wtool-corpus": 1, "whole": {...}, "line": {...}, "fragment": {...}}`。
+    Json,
+}
+
+impl CorpusFormat {
+    /// 给人看的名字，用于日志和前端。
+    pub fn name(self) -> &'static str {
+        match self {
+            CorpusFormat::Tsv => "行式文本（TSV）",
+            CorpusFormat::Json => "JSON",
+        }
+    }
+
+    /// 写出去时建议用的扩展名（前端拼默认文件名用）。
+    pub fn extension(self) -> &'static str {
+        match self {
+            CorpusFormat::Tsv => "tsv",
+            CorpusFormat::Json => "json",
+        }
+    }
+
+    /// 存进配置 / 从前端传进来时用的短名。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CorpusFormat::Tsv => "tsv",
+            CorpusFormat::Json => "json",
+        }
+    }
+
+    /// 短名 → 格式。认不出按 TSV（默认零配置、也是历史唯一格式）。
+    pub fn parse(s: &str) -> Self {
+        if s.trim().eq_ignore_ascii_case("json") {
+            CorpusFormat::Json
+        } else {
+            CorpusFormat::Tsv
+        }
+    }
+
+    /// 按内容嗅探：首个非空字符是 `{` 就是 JSON，否则 TSV。认不出按 TSV。
+    pub fn sniff(path: &Path) -> Result<Self> {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| Error::new(format!("读不了 {}：{e}", path.display())))?;
+        let head = raw.trim_start_matches('\u{feff}').trim_start();
+        Ok(if head.starts_with('{') {
+            CorpusFormat::Json
+        } else {
+            CorpusFormat::Tsv
+        })
+    }
+}
+
 /// 一份语料：原文按粒度分桶，每个桶里「原文 → 出现次数」。
 ///
 /// 存次数而不是「去重后的一组串」，是为了汇报「原始 N 条 / 去重后 M 条」——
@@ -134,6 +193,15 @@ impl Corpus {
             Granularity::Line => &mut self.line,
             Granularity::Fragment => &mut self.fragment,
         }
+    }
+
+    /// 三个桶按 JSON 字段名和粒度的对应关系摊开，给读写 JSON 用。
+    fn buckets(&self) -> [(&'static str, Granularity, &BTreeMap<String, u64>); 3] {
+        [
+            ("whole", Granularity::Whole, &self.whole),
+            ("line", Granularity::Line, &self.line),
+            ("fragment", Granularity::Fragment, &self.fragment),
+        ]
     }
 
     /// 原始条数：每个桶里计数相加，含重复。
@@ -239,22 +307,46 @@ fn strip_controls(s: &str) -> String {
     out
 }
 
+/// JSON 形态的版本号（和 TSV header 里的那个 1 是同一个版本）。
+const CORPUS_JSON_VERSION: u64 = 1;
+
 //-------------------------------------------------------------------------
 // 持久化：在线采集要跨多次游戏会话累计，语料得能落盘、能读回来。
 //-------------------------------------------------------------------------
 //
-// 格式和词典的转义规则共用一份（`dict::wtool` 的 escape/unescape）：
+// TSV 形态（转义规则和词典共用一份，`dict::wtool` 的 escape/unescape）：
 //
 //   #wtool-corpus 1
 //   W<TAB>一段对话（原文里 \n 转义成 \\n）
 //   L<TAB>单行
 //   F<TAB>自定义菜单项
 //
-// 行首一个字母记粒度，读回来才能按粒度分桶 —— 不然跨会话回来后全变成
-// 默认粒度，第 3 步按粒度翻就会错。
+// JSON 形态：
+//
+//   {"wtool-corpus": 1, "whole": {"原文": 次数}, "line": {...}, "fragment": {...}}
+//
+// 行首一个字母（TSV）/ 一个字段名（JSON）记粒度，读回来才能按粒度分桶 ——
+// 不然跨会话回来后全变成默认粒度，第 3 步按粒度翻就会错。
 
-/// 写语料文件，返回写进去多少条（去重后）。
-pub fn save(path: &Path, corpus: &Corpus) -> Result<usize> {
+/// 按指定格式写语料文件，返回写进去多少条（去重后）。
+pub fn save(path: &Path, corpus: &Corpus, fmt: CorpusFormat) -> Result<usize> {
+    match fmt {
+        CorpusFormat::Tsv => save_tsv(path, corpus),
+        CorpusFormat::Json => save_json(path, corpus),
+    }
+}
+
+/// 读一个语料文件。格式按内容嗅探，两种都认。
+/// 行首字母 / 字段名不认识都报错 —— 别把粒度拼错。
+pub fn load(path: &Path) -> Result<Corpus> {
+    match CorpusFormat::sniff(path)? {
+        CorpusFormat::Tsv => load_tsv(path),
+        CorpusFormat::Json => load_json(path),
+    }
+}
+
+/// 写 TSV 形态，返回写进去多少条（去重后）。
+fn save_tsv(path: &Path, corpus: &Corpus) -> Result<usize> {
     let mut out = String::new();
     out.push_str(CORPUS_HEADER);
     out.push('\n');
@@ -272,8 +364,25 @@ pub fn save(path: &Path, corpus: &Corpus) -> Result<usize> {
     Ok(n)
 }
 
-/// 读一个语料文件。读不出来、行首字母不认识都报错 —— 别把粒度拼错。
-pub fn load(path: &Path) -> Result<Corpus> {
+/// 写 JSON 形态，返回写进去多少条（去重后）。
+///
+/// 和 TSV 的差别：JSON 把出现次数也留着（TSV 只存去重后的原文，计数落盘即丢）。
+/// 两种都是合法语料，读的时候按格式各自解释。
+fn save_json(path: &Path, corpus: &Corpus) -> Result<usize> {
+    let mut doc = serde_json::Map::new();
+    doc.insert(
+        "wtool-corpus".to_string(),
+        serde_json::Value::from(CORPUS_JSON_VERSION),
+    );
+    for (key, _, map) in corpus.buckets() {
+        doc.insert(key.to_string(), serde_json::to_value(map)?);
+    }
+    std::fs::write(path, serde_json::to_string_pretty(&doc)?)?;
+    Ok(corpus.unique())
+}
+
+/// 读 TSV 形态的语料。
+fn load_tsv(path: &Path) -> Result<Corpus> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| Error::new(format!("读不了 {}：{e}", path.display())))?;
     let mut corpus = Corpus::new();
@@ -303,6 +412,44 @@ pub fn load(path: &Path) -> Result<Corpus> {
                 ))
             })?;
         corpus.push(g, &wtool::unescape(rest)?);
+    }
+
+    Ok(corpus)
+}
+
+/// 读 JSON 形态的语料。
+fn load_json(path: &Path) -> Result<Corpus> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| Error::new(format!("读不了 {}：{e}", path.display())))?;
+    let doc: serde_json::Value = serde_json::from_str(&raw)?;
+
+    let version = doc
+        .get("wtool-corpus")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            Error::new(format!(
+                "{} 看着像 JSON，但没有 wtool-corpus 版本标记",
+                path.display()
+            ))
+        })?;
+    if version != CORPUS_JSON_VERSION {
+        return Err(Error::new(format!(
+            "{} 是语料格式第 {version} 版，本版只认第 {CORPUS_JSON_VERSION} 版",
+            path.display()
+        )));
+    }
+
+    let mut corpus = Corpus::new();
+    // 字段名 → 粒度，逐个桶读回来。
+    let buckets: [(&str, Granularity); 3] = [
+        ("whole", Granularity::Whole),
+        ("line", Granularity::Line),
+        ("fragment", Granularity::Fragment),
+    ];
+    for (key, g) in buckets {
+        let Some(v) = doc.get(key) else { continue };
+        let map: BTreeMap<String, u64> = serde_json::from_value(v.clone())?;
+        *corpus.map_mut(g) = map;
     }
 
     Ok(corpus)
@@ -366,7 +513,7 @@ mod tests {
         c.push(Granularity::Line, "こんにちは"); // 重复，只加计数
         c.push(Granularity::Fragment, "\\I[188]手帳");
 
-        let n = save(&path, &c).unwrap();
+        let n = save(&path, &c, CorpusFormat::Tsv).unwrap();
         assert_eq!(n, c.unique());
 
         let back = load(&path).unwrap();
@@ -374,6 +521,28 @@ mod tests {
         assert_eq!(back.unique(), c.unique());
         // 原文与粒度逐项一致（重复的「こんにちは」在去重后发现不了差异）
         assert_eq!(back.flat(), c.flat());
+    }
+
+    /// JSON 形态：粒度、原文、出现次数都原样读回。
+    #[test]
+    fn json_roundtrip_keeps_counts_and_granularity() {
+        let dir = scratch("json");
+        let path = dir.join("corpus.json");
+        let mut c = Corpus::new();
+        c.push(Granularity::Whole, "一行目\n二行目");
+        c.push(Granularity::Line, "こんにちは");
+        c.push(Granularity::Line, "こんにちは"); // 重复：JSON 会留着计数
+        c.push(Granularity::Fragment, "\\I[188]手帳");
+
+        // 写出去的就是 JSON（嗅探能认出来）。
+        let n = save(&path, &c, CorpusFormat::Json).unwrap();
+        assert_eq!(n, c.unique());
+        assert_eq!(CorpusFormat::sniff(&path).unwrap(), CorpusFormat::Json);
+
+        let back = load(&path).unwrap();
+        assert_eq!(back.per_granularity(), (1, 1, 1));
+        assert_eq!(back.flat(), c.flat());
+        assert_eq!(back.total(), c.total(), "JSON 保留出现次数");
     }
 
     /// 坏的粒度字母要报错，不能猜。

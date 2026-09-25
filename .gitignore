@@ -24,6 +24,10 @@ dist-ssr
 *.sw?
 .trae
 
+# Python cache
+__pycache__/
+*.pyc
+
 # wtool generated test artifacts
 src-tauri/.probe_corpus/
 src-tauri/probe_translate/

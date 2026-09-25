@@ -109,18 +109,32 @@ impl EngineType {
     }
 }
 
-/// 把用户填的那串路径收拾成一个游戏目录。
+/// 把用户填的那串路径收拾干净：掐掉首尾空白，去掉里面的引号。
 ///
 /// 用户是从文件管理器或别处复制粘贴过来的，粘进来什么样都有可能：Windows
-/// 复制路径默认带一对引号，前后可能还夹着空格，也可能干脆指到了
-/// `Game.exe` 而不是它所在的目录。这些都不该让下游每个 `is_file()` 去猜，
-/// 在入口处一次性收拾干净。
+/// 复制路径默认带一对引号（有时还是全角的「」/“”），前后可能还夹着空格。
+/// 这些都不该让下游每个 `is_file()` 去猜，在入口处一次性收拾干净。
+///
+/// **只去引号，不碰别的**：路径里的空格是合法的（`D:\My Game`），不能顺手 trim 掉。
+pub fn clean_path(raw: &str) -> String {
+    raw.chars()
+        // 半角、以及从聊天软件/文档里带过来的全角引号，一律去掉。
+        .filter(|c| !matches!(c, '"' | '\u{201c}' | '\u{201d}' | '\u{300c}' | '\u{300d}'))
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// 把用户填的那串路径收拾成一个游戏目录。
+///
+/// 在 [`clean_path`] 的基础上多做一步：用户可能干脆指到了 `Game.exe` 而不是
+/// 它所在的目录。指到文件就改用它所在的目录。
 ///
 /// 之所以能容忍「指到 exe」：判据只看目录结构（见 [`get_engine_type`]），
 /// 多退回一层父目录没有任何歧义 —— 游戏的可执行文件就躺在游戏根目录里。
 pub fn resolve_game_dir(raw: &str) -> PathBuf {
-    let trimmed = raw.trim().trim_matches('"').trim();
-    let p = Path::new(trimmed);
+    let cleaned = clean_path(raw);
+    let p = Path::new(&cleaned);
     // 指到文件（多半是 Game.exe）时，改用它所在的目录。
     if p.is_file() {
         if let Some(parent) = p.parent() {

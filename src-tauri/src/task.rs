@@ -30,8 +30,8 @@ use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter};
 
-use crate::corpus::{self, online};
-use crate::dict::{DictFormat, mtool, wtool};
+use crate::corpus::{self, online, CorpusFormat};
+use crate::dict::{mtool, DictFormat};
 use crate::engine::inject::{self, State};
 use crate::translate;
 use crate::engine::link::{TcpLink, PORT};
@@ -68,11 +68,16 @@ pub struct Config {
     pub corpus_path: String,
     /// 离线翻译产出的词典文件路径（`--out`）。
     pub out_path: String,
+    /// 语料输出格式（`tsv` / `json`）。只在**新建**语料文件时起作用；
+    /// 文件已存在就沿用它自己的格式，别把用户攒了半天的东西换格式重排。
+    pub corpus_format: String,
+    /// 词典输出格式（`tsv` / `json`）。同上：只在新建输出文件时起作用。
+    pub dict_format: String,
     /// LLM 接口基址（OpenAI 兼容），如 `https://api.deepseek.com`。
     pub llm_base_url: String,
     /// LLM 模型名，如 `deepseek-chat`。
     pub llm_model: String,
-    /// LLM API key（Bearer）。GUI 暂无翻译入口，主要从命令行 `--key` 传进来。
+    /// LLM API key（Bearer）。配置文件里没有时退到环境变量 `WTOOL_LLM_KEY`。
     pub llm_api_key: String,
     /// 一次请求喂多少条原文。
     pub llm_batch: usize,
@@ -87,11 +92,38 @@ static CONFIG: Mutex<Config> = Mutex::new(Config {
     collect: false,
     corpus_path: String::new(),
     out_path: String::new(),
+    corpus_format: String::new(),
+    dict_format: String::new(),
     llm_base_url: String::new(),
     llm_model: String::new(),
     llm_api_key: String::new(),
     llm_batch: 20,
 });
+
+impl Config {
+    /// 从应用配置（`config.json` / 前端表单）拼一份任务配置。
+    ///
+    /// `collect` 是**任务形态**、不是配置项（同一个游戏目录既能翻也能采），
+    /// 所以由调用方给，不写进配置文件。
+    pub fn from_app(app: &crate::config::AppConfig, collect: bool) -> Self {
+        Self {
+            game_dir: app.game_dir.clone(),
+            dict_path: app.dict_path.clone(),
+            font: app.font.clone(),
+            translate_backend: app.translate_backend.clone(),
+            collect,
+            corpus_path: app.corpus_path.clone(),
+            out_path: app.out_path.clone(),
+            corpus_format: app.corpus_format.clone(),
+            dict_format: app.dict_format.clone(),
+            llm_base_url: app.llm_base_url.clone(),
+            llm_model: app.llm_model.clone(),
+            // key 走 `api_key()`：配置文件里没有就退环境变量。
+            llm_api_key: app.api_key(),
+            llm_batch: app.llm_batch,
+        }
+    }
+}
 
 /// 写入配置，由 `commands::set_config` 在点「开始翻译」之前调用。
 pub fn set_config(cfg: Config) {
@@ -101,7 +133,8 @@ pub fn set_config(cfg: Config) {
 /// 取一份配置副本。
 ///
 /// 任务线程起手就抄一份，之后 GUI 再改都不影响已经在跑的这个任务。
-fn config() -> Config {
+/// `commands` 也用它来预判「这次要不要起常驻服务」。
+pub fn config() -> Config {
     CONFIG.lock().unwrap().clone()
 }
 
@@ -117,9 +150,12 @@ pub fn trainning(app: &AppHandle) -> Handle {
     let sink = AppSink(app.clone());
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
 
-    thread::spawn(move || match run(&sink, stop_rx) {
-        Ok(()) => sink.say("翻译结束".to_string()),
-        Err(e) => sink.say(format!("翻译结束：{e}")),
+    // 正常结束的消息由 `run` 自己说（它才分得清「装完就收工」和「被停止」）；
+    // 这里只管兜住错误。
+    thread::spawn(move || {
+        if let Err(e) = run(&sink, stop_rx) {
+            sink.say(format!("翻译结束：{e}"));
+        }
     });
 
     Handle { _stop: stop_tx }
@@ -140,9 +176,10 @@ pub fn trainning_collect(app: &AppHandle) -> Result<Handle> {
 
     let sink = AppSink(app.clone());
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
-    thread::spawn(move || match run_collecting(&sink, stop_rx) {
-        Ok(()) => sink.say("采集结束".to_string()),
-        Err(e) => sink.say(format!("采集结束：{e}")),
+    thread::spawn(move || {
+        if let Err(e) = run_collecting(&sink, stop_rx) {
+            sink.say(format!("采集结束：{e}"));
+        }
     });
     Ok(Handle { _stop: stop_tx })
 }
@@ -152,15 +189,36 @@ pub fn trainning_collect(app: &AppHandle) -> Result<Handle> {
 /// 存在的意义是自测 —— 图形界面点一遍要动鼠标，命令行一条命令起、
 /// 日志直接打在终端上。阻塞到出错或者进程被杀（后者等价于「停止」）。
 pub fn run_cli(cfg: Config) {
-    let collecting = cfg.collect; // 置入全局前先记住，等会儿选结束语。
     set_config(cfg);
-
     // 这个 Sender 活到函数结束，所以 `recv_timeout` 永远只会超时，不会 Disconnected。
     let (_stop_tx, stop_rx) = mpsc::channel::<()>();
+    if let Err(e) = run(&StdoutSink, stop_rx) {
+        eprintln!("[wtool] 出错：{e}");
+    }
+}
 
-    match run(&StdoutSink, stop_rx) {
-        Ok(()) => println!("[wtool] {}", if collecting { "采集结束" } else { "翻译结束" }),
-        Err(e) => eprintln!("[wtool] 出错：{e}"),
+/// 无窗口主机（`--host`）：和 [`run_cli`] 跑同一套翻译循环，只是日志多落一份文件。
+///
+/// 存在的意义是给「游戏目录里那个 `.cmd` / 计划任务」当后台常驻服务：脚本启动
+/// 没有终端可看，日志必须落盘，不然出问题什么都查不到。日志写 [`crate::config::log_path`]
+/// （`%APPDATA%\wtool\host.log`），每次启动覆盖重写 —— 一次运行一份日志。
+pub fn run_host(cfg: Config, log_path: &Path) {
+    set_config(cfg);
+
+    // 这个 Sender 活到函数结束，所以 `recv_timeout` 只会超时，不会 Disconnected。
+    let (_stop_tx, stop_rx) = mpsc::channel::<()>();
+
+    let sink = match FileSink::open(log_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[wtool] 打不开日志文件 {}：{e}", log_path.display());
+            return;
+        }
+    };
+    sink.say(format!("主机启动，日志 {}", log_path.display()));
+
+    if let Err(e) = run(&sink, stop_rx) {
+        sink.say(format!("出错：{e}"));
     }
 }
 
@@ -223,6 +281,15 @@ fn run(sink: &dyn Reporter, stop_rx: Receiver<()>) -> Result<()> {
         for line in method.install(Path::new(game_dir), dict_path, &cfg.font)? {
             sink.say(line);
         }
+
+        // 不需要常驻服务的注入方式（RGSS3 的 NWPatch 钩子）：钩子自带词典、
+        // 在游戏进程内查表，装完就是终态。这里**不监听端口、不起查表线程**，
+        // 直接收工 —— 游戏那边开着就翻译，wtool 开不开都无所谓。
+        if !method.needs_server() {
+            sink.say("钩子已安装（持久）。启动游戏即可翻译，无需保持 wtool 打开。".to_string());
+            return Ok(());
+        }
+
         injected = true;
         break;
     }
@@ -354,7 +421,7 @@ fn run(sink: &dyn Reporter, stop_rx: Receiver<()>) -> Result<()> {
 /// 定位要的那几个 `Data/*.rvdata2`，逐个 seek 读。这里是同步函数，不过 Tauri
 /// 命令跑在 worker 线程上，界面不会冻；真嫌慢再挪进后台线程（那时复用
 /// `trainning_collect` 的 `Handle` 语义）。
-pub fn collect_offline(game_dir: &str, out: &std::path::Path) -> Result<String> {
+pub fn collect_offline(game_dir: &str, out: &std::path::Path, fmt: CorpusFormat) -> Result<String> {
     let dir = resolve_game_dir(game_dir);
 
     // 「去哪儿找文本」按**引擎的数据格式**分派，不按游戏分：MV/MZ 是明文 JSON、
@@ -376,12 +443,13 @@ pub fn collect_offline(game_dir: &str, out: &std::path::Path) -> Result<String> 
         }
     };
 
-    let n = corpus::save(out, &corpus)?;
+    let n = corpus::save(out, &corpus, fmt)?;
     Ok(format!(
-        "{} 扫描完毕，{}，已写进 {}（去重 {n} 条）",
+        "{} 扫描完毕，{}，已写进 {}（{}，去重 {n} 条）",
         dir.display(),
         corpus.stats(),
-        out.display()
+        out.display(),
+        fmt.name()
     ))
 }
 
@@ -460,28 +528,32 @@ fn run_translate_file(
     let corpus = corpus::load(Path::new(corpus_path))?;
     let out = Path::new(out_path);
 
-    // 输出文件开工前就认格式，别等翻了半天才炸：
+    // 输出格式：文件已存在就沿用它自己的（嗅探得出），不存在才按配置新建 ——
+    // 这样「续传」一定接得上原来的文件，而「另存为换个格式」是 `convert_dict` 的事。
+    //
+    // 开工前就认格式，别等翻了半天才炸：
     //  - 已存在但不是 wtool 能读写的格式（含 MTool 的只读 JSON）→ 现在就说清楚，
     //    省得一批都翻完了才报「不是 UTF-8」，白烧 API 又让用户以为坏了一半。
     //  - 已存在且是 wtool 自身格式 → 当断点续传集，继续翻缺的那部分。
-    //  - 不存在 → 首次运行，直接新建。
-    if out.exists() {
-        match DictFormat::sniff(out) {
-            Ok(DictFormat::MtoolJson) => {
+    //  - 不存在 → 首次运行，按配置的格式新建。
+    let out_fmt = if out.exists() {
+        match DictFormat::sniff(out)? {
+            DictFormat::MtoolJson => {
                 return Err(Error::new(format!(
                     "{} 是 MTool 词典（只读格式），wtool 不会往里写。\n\
                      请给 wtool 自己的输出路径，例如一个新文件 `dict.tsv` 或 `dict.json`。",
                     out.display()
                 )));
             }
-            Ok(_) => {} // wtool 自身格式，可续传。
-            Err(e) => return Err(e),
+            fmt => fmt, // wtool 自身格式，可续传。
         }
-    }
+    } else {
+        DictFormat::parse_out(&cfg.dict_format)
+    };
 
     // 已有译文 = 断点续传集：这文件里翻过的原文，这次不再翻。
     let merged_init: std::collections::BTreeMap<String, String> = if out.exists() {
-        wtool::read_tsv(out)?
+        out_fmt.load(out)?
     } else {
         std::collections::BTreeMap::new()
     };
@@ -513,13 +585,14 @@ fn run_translate_file(
             Err(mpsc::TryRecvError::Empty) => {}
         }
         let mut snapshot: std::collections::BTreeMap<String, String> =
-            if out.exists() { wtool::read_tsv(out)? } else { Default::default() };
+            if out.exists() { out_fmt.load(out)? } else { Default::default() };
         for (k, v) in dict {
             if !v.is_empty() {
                 snapshot.insert(k.clone(), v.clone());
             }
         }
-        wtool::write_tsv(out, &snapshot)
+        out_fmt
+            .write(out, &snapshot)
             .map_err(|e| Error::new(format!("写翻译文件失败：{e}")))?;
         Ok::<(), Error>(())
     };
@@ -534,11 +607,16 @@ fn run_translate_file(
     )?;
 
     // 累计条数 = 盘上现在的（本次已写进去了）。
-    let total = if out.exists() { wtool::read_tsv(out)?.len() } else { dict.len() };
+    let total = if out.exists() {
+        out_fmt.load(out)?.len()
+    } else {
+        dict.len()
+    };
     Ok(format!(
-        "本轮翻了 {} 条，词典累计 {} 条，已写进 {}",
+        "本轮翻了 {} 条，词典累计 {} 条（{}），已写进 {}",
         dict.len(),
         total,
+        out_fmt.name(),
         out.display()
     ))
 }
@@ -566,7 +644,10 @@ fn run_collecting(sink: &dyn Reporter, stop_rx: Receiver<()>) -> Result<()> {
         return Err(Error::new("这个目录既不像 MZ 也不像 MV，游戏目录是不是填错了？"));
     }
 
-    let mut collector = online::Collector::open(Path::new(corpus_path).to_path_buf())?;
+    let mut collector = online::Collector::open(
+        Path::new(corpus_path).to_path_buf(),
+        CorpusFormat::parse(&cfg.corpus_format),
+    )?;
     sink.say(format!("已有语料 {}", collector.stats()));
 
     // 注入方式和翻译模式同一套：桥照常把原文推上来，只是 wtool 不回译文。
@@ -581,6 +662,14 @@ fn run_collecting(sink: &dyn Reporter, stop_rx: Receiver<()>) -> Result<()> {
         sink.say(format!("注入方式：{}（{}）", method.name(), report.detail));
         for line in method.install(Path::new(game_dir), Path::new(dict_path), &cfg.font)? {
             sink.say(line);
+        }
+        // 在线采集靠游戏侧把文本推上来；不需要常驻服务的注入方式（RGSS3）
+        // 从不回报文本，这条路对它不成立 —— 当场说清楚，别让用户对着
+        // 「正在监听」干等。RGSS3 收料请用「离线扫描」。
+        if !method.needs_server() {
+            return Err(Error::new(
+                "这个引擎的钩子不向 wtool 回报文本，在线采集不适用。请改用「离线扫描」收语料。",
+            ));
         }
         injected = true;
         break;
@@ -703,5 +792,37 @@ struct StdoutSink;
 impl Reporter for StdoutSink {
     fn say(&self, msg: String) {
         println!("[wtool] {msg}");
+    }
+}
+
+/// 主机模式：终端 + 日志文件各一份。
+///
+/// 每条都 flush，是故意的：主机多半是被强杀（关终端、关机）停下的，
+/// 攒在缓冲区里那几行日志恰恰是最关键的那几行。
+struct FileSink {
+    file: Mutex<std::fs::File>,
+}
+
+impl FileSink {
+    fn open(path: &Path) -> Result<Self> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        // 覆盖重写：一次运行一份日志，不跟上次的混在一起。
+        let file = std::fs::File::create(path)?;
+        Ok(Self {
+            file: Mutex::new(file),
+        })
+    }
+}
+
+impl Reporter for FileSink {
+    fn say(&self, msg: String) {
+        println!("[wtool] {msg}");
+        use std::io::Write;
+        if let Ok(mut f) = self.file.lock() {
+            let _ = writeln!(f, "{msg}");
+            let _ = f.flush();
+        }
     }
 }

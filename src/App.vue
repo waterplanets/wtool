@@ -1,827 +1,331 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from "vue";
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
-import { open, save } from "@tauri-apps/plugin-dialog";
+//! 应用外壳：左侧导航 + 右侧内容 + 底部日志。
+//!
+//! 五个页面的分工是照着「用户实际要干的事」分的，不是照着代码模块分的：
+//!
+//!   翻译      —— 主流程（选游戏 → 选词典 → 开始），一体化，不问引擎
+//!   采集语料  —— 攒原文（在线采集 / 离线扫描）
+//!   离线翻译  —— 语料翻成词典（唯一能断点续传的地方）
+//!   词典与格式 —— 另存为 / 换格式、看词表
+//!   高级      —— 注入方式手动档、启动脚本、东西都存在哪
+//!
+//! 日志是全局面板而不是某一页的东西：三个任务都可能往它写，用户来回切页也
+//! 不该把日志丢了。
 
-/** 与 Rust 侧 model::TsSentence 一一对应 */
-interface TsSentence {
-  source: string;
-  target: string;
-}
+import { computed, markRaw, nextTick, onMounted, ref, watch } from "vue";
 
-/** 与 Rust 侧 engine::inject::MethodStatus 一一对应 */
-interface MethodStatus {
-  id: string;
-  name: string;
-  state: "not_applicable" | "ready" | "installed" | "stale";
-  detail: string;
-  reversible:
-    | "runtime_full"
-    | "runtime_and_offline"
-    | "offline_only"
-    | "none";
-  restart_required: boolean;
-}
+import AdvancedPanel from "./components/AdvancedPanel.vue";
+import CollectPanel from "./components/CollectPanel.vue";
+import FlowPanel from "./components/FlowPanel.vue";
+import FormatPanel from "./components/FormatPanel.vue";
+import OfflinePanel from "./components/OfflinePanel.vue";
+import { init, engine, error, logs, running, stop } from "./store";
 
-/** 状态/撤销程度的中文说法，只影响显示，逻辑判断还是用原值 */
-const STATE_TEXT: Record<MethodStatus["state"], string> = {
-  not_applicable: "不适用",
-  ready: "未安装",
-  installed: "已安装",
-  stale: "需重装",
-};
-const REVERSIBLE_TEXT: Record<MethodStatus["reversible"], string> = {
-  runtime_full: "断开即恢复",
-  runtime_and_offline: "断开并还原文件",
-  offline_only: "只能还原文件",
-  none: "只能重启游戏",
-};
+const TABS = [
+  { id: "flow", label: "翻译", hint: "选游戏 → 开始", view: markRaw(FlowPanel) },
+  { id: "collect", label: "采集语料", hint: "攒待翻的原文", view: markRaw(CollectPanel) },
+  { id: "offline", label: "离线翻译", hint: "语料 → 词典", view: markRaw(OfflinePanel) },
+  { id: "format", label: "词典与格式", hint: "另存为 / 看词表", view: markRaw(FormatPanel) },
+  { id: "advanced", label: "高级", hint: "注入 / 脚本 / 路径", view: markRaw(AdvancedPanel) },
+];
 
-/** 上次填过的配置。存 localStorage，重启不用重填（纯前端，Rust 那边不掺和）。 */
-const SAVED_KEY = "wtool-config";
-const saved: Record<string, string> = (() => {
-  try {
-    return JSON.parse(localStorage.getItem(SAVED_KEY) ?? "{}");
-  } catch {
-    return {}; // 存档坏了就当没存过，不值得为此挡住界面
-  }
-})();
+const active = ref("flow");
+const current = computed(() => TABS.find((t) => t.id === active.value) ?? TABS[0]);
 
-/** GUI 上填的变量，对应 Rust 侧 task::Config */
-const gameDir = ref(saved.gameDir ?? "");
-const dictPath = ref(
-  saved.dictPath ?? (saved.gameDir ? `${saved.gameDir}\\TrsData.bin` : ""),
-);
+/** 日志面板收起来了没有。默认开着 —— 出问题时第一眼就该看到它。 */
+const logsOpen = ref(true);
+const logBox = ref<HTMLElement | null>(null);
 
-/** 词典路径是否被手动改过。改过就不再跟着游戏目录自动改，免得覆盖用户的输入。 */
-const dictManual = ref(Boolean(saved.dictPath));
-
-/** 目标字体。空串 = 不指定（RGSS3 钩子用它内置的黑体，MZ 保持游戏原字体）。 */
-const font = ref(saved.font ?? "");
-
-/** 系统里装了哪些字体。菜单的候选就是它 —— WebView 自己拿不到这份清单，问 Rust。 */
-const systemFonts = ref<string[]>([]);
-
-/**
- * 菜单里的候选：系统字体 + 「当前这个」。
- * 上次存的字体有可能这台机器上没装（换机器、或字体被卸了），补进来免得选完变空。
- */
-const fontOptions = computed(() => {
-  const list = systemFonts.value;
-  const cur = font.value.trim();
-  return cur && !list.includes(cur) ? [cur, ...list] : list;
-});
-
-/** 拉一次系统字体。拉不到就空表，菜单退化成「只有不指定 + 手填过的那个」。 */
-async function loadSystemFonts() {
-  try {
-    systemFonts.value = await invoke<string[]>("list_system_fonts");
-  } catch {
-    systemFonts.value = [];
-  }
-}
-
-onMounted(loadSystemFonts);
-
-/** 翻译后端。gtx = Google 网页接口（免费零配置）；llm = OpenAI 兼容接口（要 key）。 */
-const translateBackend = ref(saved.translateBackend ?? "gtx");
-
-/** 「离线翻译」页的输入：语料 → 词典 */
-const corpusPath = ref(saved.corpusPath ?? "");
-const outPath = ref(saved.outPath ?? "");
-const llmBaseUrl = ref(saved.llmBaseUrl ?? "https://api.deepseek.com");
-const llmModel = ref(saved.llmModel ?? "deepseek-chat");
-/**
- * API key 不存本地 —— 那是凭据，落到 localStorage 等于明文躺在磁盘上。
- * 每次开界面重填一次。
- */
-const llmApiKey = ref("");
-const llmBatch = ref(saved.llmBatch ?? "20");
-
-/** 当前激活的标签页 */
-const activeTab = ref<string>("live");
-
-/** 有后台任务在跑：这时禁用「开始」，免得连点起好几个任务。 */
-const running = ref(false);
-/** 离线扫描（同步命令）在跑：单独一档，`running` 说的是后台任务。 */
-const scanning = ref(false);
-
-/** 游戏目录改了就顺手把词典路径带过去（MTool 的词典就放在游戏根目录）。 */
-watch(gameDir, (dir) => {
-  if (!dictManual.value) dictPath.value = `${dir}\\TrsData.bin`;
-});
-
-/** 配置一改就落盘，下次开界面还在。API key 不在里面（见上面那句注释）。 */
+// 新日志进来就滚到底，不然用户得自己往下拖。
 watch(
-  [
-    gameDir,
-    dictPath,
-    font,
-    translateBackend,
-    corpusPath,
-    outPath,
-    llmBaseUrl,
-    llmModel,
-    llmBatch,
-  ],
-  () => {
-    try {
-      localStorage.setItem(
-        SAVED_KEY,
-        JSON.stringify({
-          gameDir: gameDir.value,
-          dictPath: dictPath.value,
-          font: font.value,
-          translateBackend: translateBackend.value,
-          corpusPath: corpusPath.value,
-          outPath: outPath.value,
-          llmBaseUrl: llmBaseUrl.value,
-          llmModel: llmModel.value,
-          llmBatch: llmBatch.value,
-        }),
-      );
-    } catch {
-      // 存不下（隐私模式之类）就算了，不影响翻译。
-    }
+  () => logs.value.length,
+  async () => {
+    if (!logsOpen.value) return;
+    await nextTick();
+    if (logBox.value) logBox.value.scrollTop = logBox.value.scrollHeight;
   },
 );
 
-/** 识别出来的引擎，光看这一行就能判断路径填得对不对 */
-const engineName = ref("");
-
-const entries = ref<TsSentence[]>([]);
-const logs = ref<string[]>([]);
-const error = ref("");
-
-/** 这个游戏目录上支持的注入方式，以及各自现在什么状态 */
-const methods = ref<MethodStatus[]>([]);
-
-// Rust 那边 app.emit("trans-status", msg)，这里收
-listen<string>("trans-status", (e) => {
-  logs.value.push(e.payload);
-  if (logs.value.length > 200) logs.value.shift();
+/** 状态栏那句「现在在干什么」。 */
+const statusText = computed(() => {
+  if (running.value) return "任务运行中";
+  return "空闲";
 });
 
-/** 重新探测注入方式。目录一变就重探，免得对着 A 游戏的状态操作 B 游戏。 */
-async function refreshInjections() {
-  try {
-    engineName.value = await invoke<string>("detect_engine", {
-      gameDir: gameDir.value,
-    });
-  } catch {
-    engineName.value = "";
-  }
-  try {
-    methods.value = await invoke<MethodStatus[]>("list_injections", {
-      gameDir: gameDir.value,
-    });
-  } catch (e: any) {
-    methods.value = [];
-    error.value = e?.message ?? String(e);
-  }
-}
-
-/** 从文件管理器挑游戏目录。目录判据在后端，选中直接填进去就行。 */
-async function pickGameDir() {
-  const dir = await open({ directory: true, multiple: false });
-  if (typeof dir === "string") gameDir.value = dir;
-}
-
-/** 从文件管理器挑词典文件，挑完就不跟着游戏目录自动改了。 */
-async function pickDict() {
-  const file = await open({
-    multiple: false
-    //filters: [{ name: "MTool 词典", extensions: ["bin", "json"] }],
-  });
-  if (typeof file === "string") {
-    dictPath.value = file;
-    dictManual.value = true;
-  }
-}
-
-// 目录变了重探。immediate 让打开界面就先探一次，用户不用先点一下。
-watch(gameDir, refreshInjections, { immediate: true });
-
-/** 「未安装」和「需重装」都能装：后者就是覆盖重装一遍。 */
-function canInstall(m: MethodStatus) {
-  return m.state === "ready" || m.state === "stale";
-}
-
-/** 只有盘上真有 wtool 的东西才谈得上撤销。 */
-function canUninstall(m: MethodStatus) {
-  return m.state === "installed" || m.state === "stale";
-}
-
-/** 注入：把桥写进游戏目录。装完游戏要重启才生效，所以不在这儿自动开任务。 */
-async function installMethod(id: string) {
-  error.value = "";
-  try {
-    const lines = await invoke<string[]>("install_injection", {
-      gameDir: gameDir.value,
-      id,
-      // RGSS3 这条要在装的时候把词典和字体投进游戏目录，所以顺带交过去。
-      dictPath: dictPath.value,
-      font: font.value,
-    });
-    logs.value.push(...lines);
-  } catch (e: any) {
-    error.value = e?.message ?? String(e);
-  }
-  await refreshInjections();
-}
-
-/** 取消注入：先停任务再还原文件 —— 任务还占着旧桥时去删文件容易打架。 */
-async function uninstallMethod(id: string) {
-  error.value = "";
-  try {
-    await invoke("stop_trans");
-    const lines = await invoke<string[]>("uninstall_injection", {
-      gameDir: gameDir.value,
-      id,
-    });
-    logs.value.push(...lines);
-  } catch (e: any) {
-    error.value = e?.message ?? String(e);
-  }
-  await refreshInjections();
-}
-
-/** 把界面上的变量整包交给 Rust（一个函数，直播翻译和离线翻译共用）。 */
-async function sendConfig() {
-  await invoke("set_config", {
-    gameDir: gameDir.value,
-    dictPath: dictPath.value,
-    font: font.value,
-    translateBackend: translateBackend.value,
-    corpusPath: corpusPath.value,
-    outPath: outPath.value,
-    llmBaseUrl: llmBaseUrl.value,
-    llmModel: llmModel.value,
-    llmApiKey: llmApiKey.value,
-    llmBatch: Number(llmBatch.value) || 20,
-  });
-}
-
-/** 点「开始翻译」：直播翻译（边玩边翻），先把变量交给 Rust，再起任务 */
-async function start() {
-  error.value = "";
-  logs.value = [];
-  try {
-    await sendConfig();
-    await invoke("start_trans");
-    running.value = true;
-  } catch (e: any) {
-    error.value = e?.message ?? String(e);
-  }
-}
-
-/** 「离线翻译」页：语料 → 词典，后台线程跑完把进度推给日志 */
-async function startOffline() {
-  error.value = "";
-  logs.value = [];
-  try {
-    await sendConfig();
-    await invoke("start_translate_file");
-    running.value = true;
-  } catch (e: any) {
-    error.value = e?.message ?? String(e);
-  }
-}
-
-/** 在线采集：后台线程边玩边攒，进度/结束语进日志；「停止」按钮可停。 */
-async function startCollect() {
-  error.value = "";
-  logs.value = [];
-  try {
-    await sendConfig();
-    await invoke("start_collect");
-    running.value = true;
-  } catch (e: any) {
-    error.value = e?.message ?? String(e);
-  }
-}
-
-/** 离线扫描：不开游戏直接扫目录收料，返回条数贴进日志。 */
-async function collectOffline() {
-  error.value = "";
-  scanning.value = true;
-  try {
-    const msg = await invoke<string>("collect_offline", {
-      gameDir: gameDir.value,
-      out: corpusPath.value,
-    });
-    logs.value.push(msg);
-  } catch (e: any) {
-    error.value = e?.message ?? String(e);
-  } finally {
-    scanning.value = false;
-  }
-}
-
-/** 挑一个已存在的语料文件（离线翻译页的输入）。 */
-async function pickCorpus() {
-  const file = await open({
-    multiple: false,
-    filters: [{ name: "语料", extensions: ["corpus", "txt", "json", "tsv"] }],
-  });
-  if (typeof file === "string") corpusPath.value = file;
-}
-
-/**
- * 指定语料**输出**文件。
- *
- * 这里得用 `save()` 不能用 `open()`：`open()` 只能挑已经存在的文件，
- * 用户既没法输新文件名、也谈不上选类型。
- */
-async function pickCorpusOut() {
-  const file = await save({
-    defaultPath: corpusPath.value || undefined,
-    filters: [{ name: "wtool 语料", extensions: ["tsv", "txt", "corpus"] }],
-  });
-  if (typeof file === "string") corpusPath.value = file;
-}
-
-/** 指定输出词典文件。同样是 `save()`，能输新文件名、能选类型。 */
-async function pickOut() {
-  const file = await save({
-    defaultPath: outPath.value || undefined,
-    filters: [
-      { name: "wtool 词典（TSV）", extensions: ["tsv", "txt"] },
-      { name: "wtool 词典（JSON）", extensions: ["json"] },
-    ],
-  });
-  if (typeof file === "string") outPath.value = file;
-}
-
-async function stop() {
-  error.value = "";
-  try {
-    await invoke("stop_trans");
-    running.value = false;
-  } catch (e: any) {
-    error.value = e?.message ?? String(e);
-  }
-}
-
-async function load() {
-  error.value = "";
-  try {
-    entries.value = await invoke<TsSentence[]>("load_dictionary", {
-      path: dictPath.value,
-    });
-  } catch (e: any) {
-    entries.value = [];
-    error.value = e?.message ?? String(e);
-  }
-}
+onMounted(init);
 </script>
 
 <template>
-  <main class="container">
-    <h1>wtool</h1>
-
-    <nav class="tabs">
-      <button :class="{ active: activeTab === 'live' }" @click="activeTab = 'live'">翻译</button>
-      <button :class="{ active: activeTab === 'collect' }" @click="activeTab = 'collect'">
-        采集
-      </button>
-      <button :class="{ active: activeTab === 'offline' }" @click="activeTab = 'offline'">
-        离线翻译
-      </button>
-      <button :class="{ active: activeTab === 'lexicon' }" @click="activeTab = 'lexicon'">
-        词表
-      </button>
-    </nav>
-
-    <p v-if="error" class="error">{{ error }}</p>
-
-    <!-- 直播翻译：边玩边翻 -->
-    <section v-show="activeTab === 'live'">
-      <form class="config" @submit.prevent="start">
-        <label>
-          游戏目录
-          <input v-model="gameDir" />
-          <button type="button" @click="pickGameDir">选择目录</button>
-        </label>
-        <label>
-          词典文件
-          <input v-model="dictPath" @input="dictManual = true" />
-          <button type="button" @click="pickDict">选择文件</button>
-        </label>
-        <label>
-          目标字体
-          <select v-model="font">
-            <option value="">不指定（用默认）</option>
-            <option v-for="f in fontOptions" :key="f" :value="f">{{ f }}</option>
-          </select>
-        </label>
-
-        <p class="hint">
-          列表是本机已装的字体。改动不会立刻生效：RGSS3 要重新「注入」+ 重启游戏，
-          MZ 要重新「开始翻译」再进游戏。不指定时，RGSS3 用内置的黑体，
-          MZ 保持游戏原字体。
-        </p>
-        <p class="hint" v-if="engineName">检测到引擎：{{ engineName }}</p>
-
-        <div class="row">
-          <button type="submit" :disabled="running">开始翻译</button>
-          <button type="button" :disabled="!running" @click="stop">停止</button>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="logo">w</span>
+        <div>
+          <div class="title">wtool</div>
+          <div class="sub">游戏翻译工具</div>
         </div>
-      </form>
+      </div>
 
-      <section class="inject">
-        <h2>注入方式</h2>
-        <p v-if="!methods.length" class="hint">
-          这个游戏上还没有可用的注入方式。
-        </p>
-        <table v-else>
-          <thead>
-            <tr>
-              <th>方式</th>
-              <th>状态</th>
-              <th>说明</th>
-              <th>操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="m in methods" :key="m.id">
-              <td>{{ m.name }}</td>
-              <td>{{ STATE_TEXT[m.state] }}</td>
-              <td class="detail">
-                {{ m.detail }}
-                <template v-if="m.state !== 'not_applicable'">
-                  <br />撤销：{{ REVERSIBLE_TEXT[m.reversible] }}
-                  <template v-if="m.restart_required">，装完要重启游戏</template>
-                </template>
-              </td>
-              <td class="ops">
-                <button type="button" :disabled="!canInstall(m)" @click="installMethod(m.id)">
-                  注入
-                </button>
-                <button
-                  type="button"
-                  :disabled="!canUninstall(m)"
-                  @click="uninstallMethod(m.id)"
-                >
-                  取消注入
-                </button>
-              </td>
-            </tr>
-          </tbody>
-        </table>
-      </section>
-    </section>
+      <nav>
+        <button
+          v-for="t in TABS"
+          :key="t.id"
+          class="nav-item"
+          :class="{ active: active === t.id }"
+          @click="active = t.id"
+        >
+          <span class="nav-label">{{ t.label }}</span>
+          <span class="nav-hint">{{ t.hint }}</span>
+        </button>
+      </nav>
 
-    <!-- 采集：攒语料（在线边玩边收 / 离线扫描） -->
-    <section v-show="activeTab === 'collect'">
-      <form class="config" @submit.prevent="startCollect">
-        <label>
-          游戏目录
-          <input v-model="gameDir" />
-          <button type="button" @click="pickGameDir">选择目录</button>
-        </label>
-        <label>
-          语料文件
-          <input v-model="corpusPath" placeholder="攒到的原文写到这里" />
-          <button type="button" @click="pickCorpusOut">指定输出文件</button>
-        </label>
-
-        <p class="hint">
-          在线采集：点「开始」后启动游戏正常玩一遍，剧情/菜单原文会定时落进语料文件，玩完点「停止」保存；
-          离线扫描则不开游戏，直接扫游戏目录收料（打包的游戏要先解归档，会慢一些）。
-        </p>
-        <p class="hint" v-if="engineName">检测到引擎：{{ engineName }}</p>
-
-        <div class="row">
-          <button type="submit" :disabled="running">开始在线采集</button>
-          <button type="button" :disabled="scanning" @click="collectOffline">
-            {{ scanning ? "扫描中…" : "离线扫描" }}
-          </button>
-          <button type="button" :disabled="!running" @click="stop">停止</button>
-        </div>
-      </form>
-    </section>
-
-    <!-- 离线翻译：语料 → 词典 -->
-    <section v-show="activeTab === 'offline'">
-      <form class="config" @submit.prevent="startOffline">
-        <label>
-          翻译后端
-          <select v-model="translateBackend">
-            <option value="gtx">Google gtx（免费零配置）</option>
-            <option value="llm">LLM（OpenAI 兼容）</option>
-          </select>
-        </label>
-        <label>
-          语料文件
-          <input v-model="corpusPath" placeholder="先前采集/扫描得到的语料" />
-          <button type="button" @click="pickCorpus">选择文件</button>
-        </label>
-        <label>
-          输出词典
-          <input v-model="outPath" placeholder="翻好的词典写到这里" />
-          <button type="button" @click="pickOut">指定输出文件</button>
-        </label>
-
-        <template v-if="translateBackend === 'llm'">
-          <label>
-            接口地址
-            <input v-model="llmBaseUrl" placeholder="https://api.deepseek.com" />
-          </label>
-          <label>
-            模型名
-            <input v-model="llmModel" placeholder="deepseek-chat" />
-          </label>
-          <label>
-            API Key
-            <input v-model="llmApiKey" type="password" placeholder="sk-…" />
-          </label>
-          <label>
-            每批条数
-            <input v-model="llmBatch" type="number" min="1" />
-          </label>
+      <div class="engine-chip" :class="{ known: engine?.known }">
+        <template v-if="engine?.known">
+          <div class="en-name">{{ engine.name }}</div>
+          <div class="en-rt">{{ engine.runtime }}</div>
         </template>
+        <template v-else>
+          <div class="en-name">未识别引擎</div>
+          <div class="en-rt">去「翻译」页填游戏目录</div>
+        </template>
+      </div>
+    </aside>
 
-        <p class="hint">
-          语料来自「游戏内采集 / 离线扫描」；这里把语料翻成词典。
-          词典可反复跑：已翻过的原文会被跳过（断点续传），越翻越全。
-        </p>
-        <p class="hint" v-if="translateBackend === 'gtx'">
-          注意：gtx 走境外谷歌接口，国内直连可能不通，必要时配代理环境变量 HTTPS_PROXY。
-        </p>
-
-        <div class="row">
-          <button type="submit" :disabled="running">开始翻译</button>
-          <button type="button" :disabled="!running" @click="stop">停止</button>
+    <main>
+      <header class="topbar">
+        <div>
+          <h1>{{ current.label }}</h1>
+          <p class="hint">{{ current.hint }}</p>
         </div>
-      </form>
-    </section>
-
-    <!-- 词表：词典条目 -->
-    <section v-show="activeTab === 'lexicon'">
-      <form class="config" @submit.prevent="load">
-        <label>
-          词典文件
-          <input v-model="dictPath" @input="dictManual = true" />
-          <button type="button" @click="pickDict">选择文件</button>
-        </label>
-        <div class="row">
-          <button type="submit">读取词典</button>
+        <div class="status">
+          <span class="badge" :class="running ? 'accent' : ''">{{ statusText }}</span>
+          <button v-if="running" class="danger" @click="stop">停止</button>
         </div>
-      </form>
+      </header>
 
-      <p v-if="entries.length">共 {{ entries.length }} 条</p>
+      <p v-if="error" class="error-bar">{{ error }}</p>
 
-      <table v-if="entries.length">
-        <thead>
-          <tr>
-            <th>#</th>
-            <th>原文</th>
-            <th>译文</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="(value, index) in entries" :key="index">
-            <td>{{ index + 1 }}</td>
-            <td class="source">{{ value.source }}</td>
-            <td>{{ value.target }}</td>
-          </tr>
-        </tbody>
-      </table>
-    </section>
+      <div class="content">
+        <component :is="current.view" />
+      </div>
 
-    <pre v-if="logs.length" class="logs">{{ logs.join("\n") }}</pre>
-  </main>
+      <section class="logs" :class="{ closed: !logsOpen }">
+        <button class="logs-head" @click="logsOpen = !logsOpen">
+          <span>日志</span>
+          <span class="hint">{{ logs.length }} 行 · 点击{{ logsOpen ? "收起" : "展开" }}</span>
+        </button>
+        <div v-show="logsOpen" ref="logBox" class="logs-body">
+          <p v-if="!logs.length" class="hint empty">还没有日志。开始一个任务后，进度会显示在这里。</p>
+          <pre v-else>{{ logs.join("\n") }}</pre>
+        </div>
+      </section>
+    </main>
+  </div>
 </template>
 
 <style scoped>
-.tabs {
-  display: flex;
-  justify-content: center;
-  gap: 0.5em;
-  margin: 0.5em 0 1.2em;
+.app {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  height: 100vh;
+  overflow: hidden;
 }
 
-.tabs button {
-  background: transparent;
-  border: 1px solid #cccccc80;
-}
+/*---------------------------------------------------------------------------
+  左侧导航
+---------------------------------------------------------------------------*/
 
-.tabs button.active {
-  border-color: #396cd8;
-  background: #396cd8;
-  color: #fff;
-}
-
-.container {
-  padding-top: 4vh;
-}
-
-table {
-  margin: 1em auto;
-  border-collapse: collapse;
-  font-size: 0.9em;
-  text-align: left;
-}
-
-th,
-td {
-  border: 1px solid #cccccc80;
-  padding: 0.3em 0.8em;
-  vertical-align: top;
-}
-
-th {
-  position: sticky;
-  top: 0;
-  background-color: inherit;
-}
-
-.source {
-  white-space: pre-wrap;
-}
-
-.error {
-  color: #d9534f;
-}
-
-.config label {
-  display: block;
-  margin: 0.4em 0;
-}
-
-.config input,
-.config select {
-  width: min(70vw, 720px);
-  margin-left: 0.5em;
-}
-
-.config label button {
-  margin-left: 0.4em;
-  padding: 0.4em 0.9em;
-  font-size: 0.85em;
-}
-
-.inject table {
-  margin: 0.5em auto;
-  text-align: left;
-}
-
-.inject .detail {
-  color: #888888;
-  font-size: 0.85em;
-}
-
-.inject .ops {
-  white-space: nowrap;
-}
-
-.inject .ops button {
-  padding: 0.3em 0.8em;
-  font-size: 0.85em;
-}
-
-.inject .ops button + button {
-  margin-left: 0.4em;
-}
-
-.inject .ops button:disabled {
-  cursor: default;
-  opacity: 0.45;
-  box-shadow: none;
-}
-
-.hint {
-  color: #888888;
-  font-size: 0.85em;
-}
-
-.logs {
-  max-height: 12em;
-  max-width: min(80vw, 900px);
-  margin: 1em auto;
-  padding: 0.6em 0.8em;
-  overflow: auto;
-  border: 1px solid #cccccc80;
-  border-radius: 8px;
-  font-size: 0.85em;
-  text-align: left;
-  white-space: pre-wrap;
-}
-</style>
-<style>
-:root {
-  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
-  font-size: 16px;
-  line-height: 24px;
-  font-weight: 400;
-
-  color: #0f0f0f;
-  background-color: #f6f6f6;
-
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  -webkit-text-size-adjust: 100%;
-}
-
-.container {
-  margin: 0;
-  padding-top: 10vh;
+.sidebar {
   display: flex;
   flex-direction: column;
-  justify-content: center;
-  text-align: center;
+  gap: 18px;
+  padding: 16px 12px;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  overflow-y: auto;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 6px;
 }
 
 .logo {
-  height: 6em;
-  padding: 1.5em;
-  will-change: filter;
-  transition: 0.75s;
+  width: 32px;
+  height: 32px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border-radius: 9px;
+  background: var(--accent);
+  color: #fff;
+  font-weight: 700;
+  font-size: 17px;
 }
 
-.logo.tauri:hover {
-  filter: drop-shadow(0 0 2em #24c8db);
+.title {
+  font-weight: 700;
+  letter-spacing: 0.3px;
 }
 
-.row {
+.sub,
+.en-rt {
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+
+nav {
   display: flex;
-  justify-content: center;
+  flex-direction: column;
+  gap: 3px;
 }
 
-a {
-  font-weight: 500;
-  color: #646cff;
-  text-decoration: inherit;
+.nav-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  padding: 8px 10px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  text-align: left;
 }
 
-a:hover {
-  color: #535bf2;
+.nav-item:hover:not(.active) {
+  background: var(--surface-2);
+  border-color: transparent;
+}
+
+.nav-item.active {
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+}
+
+.nav-label {
+  font-weight: 600;
+}
+
+.nav-item.active .nav-label {
+  color: var(--accent);
+}
+
+.nav-hint {
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+
+.engine-chip {
+  margin-top: auto;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+
+.engine-chip.known {
+  border-color: color-mix(in srgb, var(--ok) 40%, transparent);
+}
+
+.en-name {
+  font-size: 12.5px;
+  font-weight: 600;
+  margin-bottom: 2px;
+}
+
+/*---------------------------------------------------------------------------
+  右侧主区
+---------------------------------------------------------------------------*/
+
+main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding: 16px 20px 0;
+  overflow: hidden;
+}
+
+.topbar {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
 }
 
 h1 {
-  text-align: center;
+  font-size: 19px;
 }
 
-input,
-select,
-button {
-  border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.6em 1.2em;
-  font-size: 1em;
-  font-weight: 500;
-  font-family: inherit;
-  color: #0f0f0f;
-  background-color: #ffffff;
-  transition: border-color 0.25s;
-  box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
+.status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
-button {
-  cursor: pointer;
+.error-bar {
+  margin-bottom: 14px;
+  padding: 9px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+  font-size: 12.5px;
 }
 
-button:hover {
-  border-color: #396cd8;
-}
-button:active {
-  border-color: #396cd8;
-  background-color: #e8e8e8;
-}
-
-input,
-select,
-button {
-  outline: none;
+.content {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding-bottom: 16px;
 }
 
-#path-input {
-  margin-right: 5px;
+/*---------------------------------------------------------------------------
+  底部日志
+---------------------------------------------------------------------------*/
+
+.logs {
+  flex: none;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: var(--radius) var(--radius) 0 0;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    color: #f6f6f6;
-    background-color: #2f2f2f;
-  }
-
-  a:hover {
-    color: #24c8db;
-  }
-
-  input,
-  select,
-  button {
-    color: #ffffff;
-    background-color: #0f0f0f98;
-  }
-  button:active {
-    background-color: #0f0f0f69;
-  }
+.logs-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 8px 12px;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  font-weight: 600;
+  font-size: 12.5px;
 }
 
+.logs-head:hover {
+  background: var(--surface-2);
+}
+
+.logs-body {
+  max-height: 190px;
+  overflow: auto;
+  padding: 0 12px 10px;
+}
+
+.logs-body pre {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  color: var(--text-dim);
+}
+
+.logs-body .empty {
+  padding: 4px 0 10px;
+}
 </style>

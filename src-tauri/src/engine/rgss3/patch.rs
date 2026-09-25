@@ -109,7 +109,7 @@ impl Mechanism for Rgss3Patch {
                 } else {
                     Report {
                         state: State::Installed,
-                        detail: "已安装，游戏下次启动时加载".to_string(),
+                        detail: "已安装（持久），启动游戏即可，无需保持 wtool 打开".to_string(),
                     }
                 }
             }
@@ -131,6 +131,16 @@ impl Mechanism for Rgss3Patch {
 
     /// `Patch/Patch.rb` 是游戏启动时读的，改了得重启游戏才生效。
     fn restart_required(&self) -> bool {
+        true
+    }
+
+    /// 钩子自带词典、在游戏进程内查表，**不需要 wtool 起任何服务**。
+    fn needs_server(&self) -> bool {
+        false
+    }
+
+    /// 装完就留在游戏目录：wtool 退出时不还原，游戏照常翻译。
+    fn persistent(&self) -> bool {
         true
     }
 }

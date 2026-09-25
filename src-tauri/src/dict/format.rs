@@ -54,6 +54,25 @@ impl DictFormat {
         }
     }
 
+    /// 存进配置 / 从前端传进来时用的短名。MTool 是只读外部契约，
+    /// 归到它真实的长相（JSON）那边，反正不会用它去写。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DictFormat::WtoolTsv => "tsv",
+            DictFormat::MtoolJson | DictFormat::WtoolJson => "json",
+        }
+    }
+
+    /// 用户选「输出格式」时用的短名 → 格式。只可能落回能写的两种：
+    /// `json` 就是 wtool JSON，其余（含空串）按行式文本 —— 默认零选择。
+    pub fn parse_out(s: &str) -> Self {
+        if s.trim().eq_ignore_ascii_case("json") {
+            DictFormat::WtoolJson
+        } else {
+            DictFormat::WtoolTsv
+        }
+    }
+
     /// 猜一个文件是什么格式。认不出来就报错，并列出支持哪些。
     ///
     /// 判据只有两条，都不看文件名（用户可能随便起名字）：

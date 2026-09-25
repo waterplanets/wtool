@@ -1,0 +1,255 @@
+/*! wtool 的样式底座：一套设计变量 + 基础控件样式。
+ *
+ * 全部样式都从这里的变量取值，组件里不写死颜色 —— 换主题只动这一段。
+ * 深色是主场景（翻译工具多半在游戏旁边开着），浅色跟着系统走。
+ */
+
+:root {
+  /* 表面层次：从底到顶。卡片比页面亮一档，输入框再亮一档。 */
+  --bg: #12141a;
+  --surface: #191c24;
+  --surface-2: #21252f;
+  --border: #2b3040;
+  --border-strong: #3a4155;
+
+  --text: #e7e9ee;
+  --text-dim: #9aa1b1;
+  --text-faint: #6b7286;
+
+  /* 主色：一个克制的蓝，用在主按钮和当前选中项上。 */
+  --accent: #4c7dff;
+  --accent-hover: #6590ff;
+  --accent-soft: #4c7dff22;
+
+  --ok: #3fb950;
+  --warn: #d29922;
+  --danger: #f0603a;
+
+  --radius: 10px;
+  --radius-sm: 7px;
+  --gap: 14px;
+  --font-mono: ui-monospace, "Cascadia Code", Consolas, monospace;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f4f5f8;
+    --surface: #ffffff;
+    --surface-2: #f7f8fb;
+    --border: #e2e5ec;
+    --border-strong: #cdd2dd;
+
+    --text: #1c1f27;
+    --text-dim: #5b6472;
+    --text-faint: #8b93a3;
+
+    --accent: #2f61e0;
+    --accent-hover: #2450c4;
+    --accent-soft: #2f61e01a;
+
+    --ok: #1a7f37;
+    --warn: #9a6700;
+    --danger: #c93a1c;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+
+/*---------------------------------------------------------------------------
+  基础控件
+---------------------------------------------------------------------------*/
+
+input,
+select,
+textarea,
+button {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+}
+
+input[type="text"],
+input[type="password"],
+input[type="number"],
+select,
+textarea {
+  width: 100%;
+  padding: 8px 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  border-color: var(--accent);
+}
+
+input::placeholder {
+  color: var(--text-faint);
+}
+
+select {
+  cursor: pointer;
+}
+
+button {
+  padding: 8px 14px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition:
+    background 0.15s,
+    border-color 0.15s;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  background: var(--surface);
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* 主按钮：一屏只该有一个，就是那颗「开始」。 */
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+
+button.primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+button.danger {
+  color: var(--danger);
+}
+
+button.wide {
+  width: 100%;
+  padding: 12px;
+  font-size: 15px;
+}
+
+/*---------------------------------------------------------------------------
+  排版小件
+---------------------------------------------------------------------------*/
+
+h1,
+h2,
+h3 {
+  margin: 0;
+  font-weight: 600;
+}
+
+h2 {
+  font-size: 15px;
+}
+
+h3 {
+  font-size: 13px;
+  color: var(--text-dim);
+  font-weight: 600;
+}
+
+p {
+  margin: 0;
+}
+
+code {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  padding: 1px 5px;
+  background: var(--surface-2);
+  border-radius: 4px;
+}
+
+.hint {
+  color: var(--text-faint);
+  font-size: 12.5px;
+}
+
+.muted {
+  color: var(--text-dim);
+}
+
+/* 卡片：面板里所有成块的内容都是这个。 */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px;
+}
+
+/* 状态徽章 */
+.badge {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  border: 1px solid var(--border-strong);
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.badge.ok {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 45%, transparent);
+  background: color-mix(in srgb, var(--ok) 12%, transparent);
+}
+
+.badge.warn {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 45%, transparent);
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+}
+
+.badge.accent {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: var(--accent-soft);
+}
+
+/* 滚动条：默认那个在深色下太扎眼。 */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}

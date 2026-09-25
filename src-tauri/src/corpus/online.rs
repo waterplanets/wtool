@@ -12,26 +12,32 @@
 
 use std::path::PathBuf;
 
-use crate::corpus::{self, Corpus, Granularity};
+use crate::corpus::{self, Corpus, CorpusFormat, Granularity};
 use crate::error::Result;
 
 /// 采集器：拼内存里的语料 + 落盘路径。每次事件把原文收进去，定时写盘，
 /// 保证玩到一半被强杀也不至于把已经玩到的料全丢。
 pub struct Collector {
     path: PathBuf,
+    /// 落盘用的格式（TSV / JSON），装的时候定死，中途不改。
+    format: CorpusFormat,
     corpus: Corpus,
 }
 
 impl Collector {
     /// 开一个采集器。目标文件已存在就读回来续写（在线采集跨多次会话累计），
     /// 不存在就从空开始。
-    pub fn open(path: PathBuf) -> Result<Self> {
+    pub fn open(path: PathBuf, format: CorpusFormat) -> Result<Self> {
         let corpus = if path.is_file() {
             corpus::load(&path)?
         } else {
             Corpus::new()
         };
-        Ok(Self { path, corpus })
+        Ok(Self {
+            path,
+            format,
+            corpus,
+        })
     }
 
     /// 一段对话（`\v[n]` 已在游戏侧展开），收整段 + 逐行。
@@ -65,7 +71,7 @@ impl Collector {
 
     /// 写盘，返回写进去多少条（去重后）。
     pub fn save(&mut self) -> Result<usize> {
-        corpus::save(&self.path, &self.corpus)
+        corpus::save(&self.path, &self.corpus, self.format)
     }
 
     /// 三个粒度各自的去重条数。
@@ -93,7 +99,7 @@ mod tests {
     /// 一段对话：整段 + 逐行都收，且去重正确。
     #[test]
     fn on_text_records_whole_and_lines() {
-        let mut c = Collector::open(scratch("text")).unwrap();
+        let mut c = Collector::open(scratch("text"), CorpusFormat::Tsv).unwrap();
         c.on_text("こんにちは世界\n二行目です");
         assert_eq!(c.stats(), "原始 3 条，去重后 3 条（整段 1 / 单行 2 / 片段 0）");
     }
@@ -101,7 +107,7 @@ mod tests {
     /// 窗口文本那批按 Fragment 收；纯 ASCII 的整批（如「HP」）该被过滤。
     #[test]
     fn on_terms_classifies_window_as_fragment_and_filters_ascii() {
-        let mut c = Collector::open(scratch("terms")).unwrap();
+        let mut c = Collector::open(scratch("terms"), CorpusFormat::Tsv).unwrap();
         c.on_terms("窗口文本", true, &["\\I[188]手帳".into()]);
         c.on_terms("窗口文本", true, &["HP".into()]);
         assert_eq!(c.per_granularity(), (0, 0, 1));
@@ -112,11 +118,11 @@ mod tests {
     fn open_resumes_and_saves_roundtrip() {
         let path = scratch("resume");
         {
-            let mut c = Collector::open(path.clone()).unwrap();
+            let mut c = Collector::open(path.clone(), CorpusFormat::Tsv).unwrap();
             c.on_text("一行目\n二行目");
             c.save().unwrap();
         }
-        let mut c = Collector::open(path).unwrap();
+        let mut c = Collector::open(path, CorpusFormat::Tsv).unwrap();
         c.on_text("新しく出た行");
         c.save().unwrap();
         // 上次收的整段(1) + 上次两行 + 这次一行 = 整段 1 / 单行 3
