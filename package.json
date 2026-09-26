@@ -2,6 +2,8 @@
   "name": "wtool",
   "private": true,
   "version": "0.1.0",
+  "license": "GPL-3.0-or-later",
+  "description": "RPG Maker 游戏的嵌入式实时翻译工具（MV / MZ / RGSS3）",
   "type": "module",
   "scripts": {
     "dev": "vite",

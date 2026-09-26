@@ -39,11 +39,25 @@ export const systemFonts = ref<string[]>([]);
 export const engineKnown = computed(() => engine.value?.known === true);
 
 /**
- * 这次会真正用上的注入方式（第一条非「不适用」的），也是
- * 「开始翻译」会选的那条 —— 后端 `inject::pick` 走的是同一个优先级。
+ * 当前生效的注入模式：配置里明确选了 `live` / `onetime` 就用它，否则用引擎的
+ * 默认模式（`auto` → MV/MZ 走实时、RGSS3 走一次性）。和后端
+ * `inject::resolve_mode` 是同一套规则。
+ */
+export const activeMode = computed<"live" | "onetime">(() => {
+  const want = config.run_mode;
+  if (want === "live" || want === "onetime") return want;
+  return engine.value?.default_mode ?? "live";
+});
+
+/**
+ * 这次会真正用上的注入方式：按当前模式筛出第一条能用的，也是「开始翻译」会选
+ * 的那条 —— 后端 `inject::pick` 走的是同一个优先级。
  */
 export const activeMethod = computed(
-  () => methods.value.find((m) => m.state !== "not_applicable") ?? null,
+  () =>
+    methods.value.find(
+      (m) => m.mode === activeMode.value && m.state !== "not_applicable",
+    ) ?? null,
 );
 
 /** 翻译要不要 wtool 常驻服务。没有可用注入方式时按 true（保守：先别关）。 */

@@ -111,13 +111,14 @@ async function start() {
           <span class="name">输出格式</span>
           <select v-model="config.dict_format">
             <option value="tsv">行式文本（TSV）</option>
-            <option value="json">JSON</option>
+            <option value="json">wtool JSON</option>
+            <option value="mtool">MTool 词典（扁平 JSON）</option>
           </select>
         </label>
       </div>
 
       <p class="hint">
-        输出格式只在**新建**这个文件时起作用。文件已存在就沿用它的格式 ——
+        输出格式只在新建这个文件时起作用。文件已存在就沿用它的格式，
         这样每次跑都在往下接着翻，不会把之前翻的丢掉。已经存在的词典想换个格式，
         去「词典与格式」页另存为。
       </p>

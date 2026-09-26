@@ -32,7 +32,7 @@ use tauri::{AppHandle, Emitter};
 
 use crate::corpus::{self, online, CorpusFormat};
 use crate::dict::{mtool, DictFormat};
-use crate::engine::inject::{self, State};
+use crate::engine::inject::{self, Mechanism, Service};
 use crate::translate;
 use crate::engine::link::{TcpLink, PORT};
 use crate::engine::lookup;
@@ -60,6 +60,9 @@ pub struct Config {
     pub dict_path: String,
     /// 目标字体名（系统中文字体）。空串 = 不替换，只走桥里那层 CJK 缺字兜底。
     pub font: String,
+    /// 用哪种注入模式：`auto`（各引擎自己成熟的那条）/ `live`（实时连接）/
+    /// `onetime`（一次性注入）。见 `engine::inject::resolve_mode`。
+    pub run_mode: String,
     /// 翻译后端：`gtx`（Google 网页接口，免费零配置）或 `llm`（OpenAI 兼容接口）。
     pub translate_backend: String,
     /// 是不是「采集模式」：不翻只攒料，收到的原文落进 `corpus_path`（第 2 步）。
@@ -88,6 +91,7 @@ static CONFIG: Mutex<Config> = Mutex::new(Config {
     game_dir: String::new(),
     dict_path: String::new(),
     font: String::new(),
+    run_mode: String::new(),
     translate_backend: String::new(),
     collect: false,
     corpus_path: String::new(),
@@ -110,6 +114,7 @@ impl Config {
             game_dir: app.game_dir.clone(),
             dict_path: app.dict_path.clone(),
             font: app.font.clone(),
+            run_mode: app.run_mode.clone(),
             translate_backend: app.translate_backend.clone(),
             collect,
             corpus_path: app.corpus_path.clone(),
@@ -261,44 +266,55 @@ fn run(sink: &dyn Reporter, stop_rx: Receiver<()>) -> Result<()> {
 
     // 挑一条注入方式把通道架进去。
     //
-    // 「一种引擎可能有多种注入方式，而且不是每种都通用」这件事，全部收在
-    // `engine::inject` 里：这里只按优先级问一遍，挑到第一条能用的就用它。
-    // 挑不到必须当场报错，不能让用户对着「正在监听」的日志干等 ——
-    // 通道没架进去，游戏永远不会连过来。
-    let methods = inject::mechanisms(kind);
-    let mut injected = false;
-    for method in &methods {
-        let report = method.probe(Path::new(game_dir));
-        if report.state == State::NotApplicable {
-            // 这条路在这个游戏上不成立，说一声再试下一条。
-            sink.say(format!("{}：{}", method.name(), report.detail));
-            continue;
-        }
+    // 「一种引擎有两条路（实时 / 一次性），而每条路在具体游戏上未必成立」这件事，
+    // 全部收在 `engine::inject` 里：这里先按配置 + 引擎定下模式
+    //（`auto` → MV/MZ 走实时、RGSS3 走一次性，见 `resolve_mode`），再让 `pick`
+    // 在那一档里挑第一条能用的。挑不到必须当场报错，不能让用户对着「正在监听」
+    // 的日志干等 —— 通道没架进去，游戏永远不会连过来。
+    let mode = inject::resolve_mode(&cfg.run_mode, kind);
+    let Some(method) = inject::pick(kind, Path::new(game_dir), mode) else {
+        return Err(Error::new(format!(
+            "{}（{}）上还没有可用的注入方式（{}模式）",
+            kind.name(),
+            kind.runtime().name(),
+            mode.name()
+        )));
+    };
 
-        sink.say(format!("注入方式：{}（{}）", method.name(), report.detail));
-        // 装：写插件文件 + 在 plugins.js 里打开它（RGSS3 则是转词典 + 追加 Patch.rb）。
-        // 幂等，第二次起就只是读一遍确认。
-        for line in method.install(Path::new(game_dir), dict_path, &cfg.font)? {
-            sink.say(line);
-        }
+    // 同一个引擎的另一条路会和这条重叠挂钩（同一段对话上报两遍、同一条文本查两次
+    // 表），装之前先把另一条卸掉。卸失败不阻断，顶多重叠，日志里有原因。
+    for line in inject::uninstall_siblings(kind, Path::new(game_dir), method.id()) {
+        sink.say(line);
+    }
 
-        // 不需要常驻服务的注入方式（RGSS3 的 NWPatch 钩子）：钩子自带词典、
-        // 在游戏进程内查表，装完就是终态。这里**不监听端口、不起查表线程**，
-        // 直接收工 —— 游戏那边开着就翻译，wtool 开不开都无所谓。
-        if !method.needs_server() {
+    let report = method.probe(Path::new(game_dir));
+    sink.say(format!(
+        "注入方式：{}（{}模式，{}）",
+        method.name(),
+        mode.name(),
+        report.detail
+    ));
+    // 装：写插件文件 + 在 plugins.js 里打开它；RGSS3 则是转词典 + 追加 Patch.rb。
+    // 幂等，第二次起就只是读一遍确认。
+    for line in method.install(Path::new(game_dir), dict_path, &cfg.font)? {
+        sink.say(line);
+    }
+
+    match method.service() {
+        // 不需要常驻服务的注入方式（两条一次性路）：钩子自带词典、在游戏进程内
+        // 查表，装完就是终态。这里**不监听端口、不起查表线程**，直接收工 ——
+        // 游戏那边开着就翻译，wtool 开不开都无所谓。
+        Service::None => {
             sink.say("钩子已安装（持久）。启动游戏即可翻译，无需保持 wtool 打开。".to_string());
             return Ok(());
         }
-
-        injected = true;
-        break;
-    }
-    if !injected {
-        return Err(Error::new(format!(
-            "{}（{}）上还没有可用的注入方式",
-            kind.name(),
-            kind.runtime().name()
-        )));
+        // 文件轮询式实时（RGSS3）：钩子在游戏进程里查表，wtool 这边只负责守着
+        // 字体文件 —— 用户在界面上换字体，改写那个文件，游戏侧一秒内自己重载。
+        Service::FileSync => {
+            return run_file_sync(sink, stop_rx, method.as_ref(), Path::new(game_dir));
+        }
+        // TCP 实时（MV/MZ）：往下走监听 + 查表那条主循环。
+        Service::Tcp => {}
     }
 
     let link = bind_with_retry(PORT, Duration::from_secs(1))?;
@@ -407,6 +423,41 @@ fn run(sink: &dyn Reporter, stop_rx: Receiver<()>) -> Result<()> {
 
                 sink.say(format!("{label} {} 条，翻上 {} 条", texts.len(), map.len()));
             }
+        }
+    }
+}
+
+/// RGSS3 实时模式的主循环：钩子在游戏进程里查表，wtool 这边只负责**守着字体文件**。
+///
+/// 每 `TICK` 看一眼配置里的字体有没有变（用户在界面上换了字体），变了就改写游戏
+/// 目录里那个字体文件 —— 钩子每秒比一次 mtime，自己重载。这正是「实时模式」存在
+/// 的意义：调字体不用停游戏、不用重装。
+///
+/// 为什么不是装完就返回、还要挂着循环：`Service::FileSync` 的语义是「wtool 得开
+/// 着」—— 它一停热更新就断了；而且这条路是**非持久**的，wtool 退出时
+/// `cleanup_on_exit` 会把它卸掉，所以这个循环同时是「这次注入还活着」的凭据。
+fn run_file_sync(
+    sink: &dyn Reporter,
+    stop_rx: Receiver<()>,
+    method: &dyn Mechanism,
+    game_dir: &Path,
+) -> Result<()> {
+    // 记住装的时候用的是哪份字体，之后只对「变化」做动作。
+    let mut applied = config().font.trim().to_string();
+    sink.say("实时模式已就绪：保持 wtool 打开，改字体会即时同步进游戏。".to_string());
+
+    loop {
+        match stop_rx.recv_timeout(TICK) {
+            Err(RecvTimeoutError::Timeout) => {}
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => return Ok(()),
+        }
+
+        let want = config().font.trim().to_string();
+        if want != applied {
+            for line in method.update_font(game_dir, &want)? {
+                sink.say(line);
+            }
+            applied = want;
         }
     }
 }
@@ -531,22 +582,11 @@ fn run_translate_file(
     // 输出格式：文件已存在就沿用它自己的（嗅探得出），不存在才按配置新建 ——
     // 这样「续传」一定接得上原来的文件，而「另存为换个格式」是 `convert_dict` 的事。
     //
-    // 开工前就认格式，别等翻了半天才炸：
-    //  - 已存在但不是 wtool 能读写的格式（含 MTool 的只读 JSON）→ 现在就说清楚，
-    //    省得一批都翻完了才报「不是 UTF-8」，白烧 API 又让用户以为坏了一半。
-    //  - 已存在且是 wtool 自身格式 → 当断点续传集，继续翻缺的那部分。
-    //  - 不存在 → 首次运行，按配置的格式新建。
+    // 开工前就认格式，别等翻了半天才炸：认不出来（不是 UTF-8、不是已知 JSON 等）
+    // 现在就说清楚，省得一批都翻完了才报错，白烧 API 又让用户以为坏了一半。
+    // 三种格式都能写，所以已有的 MTool 词典也能当输出继续往下翻。
     let out_fmt = if out.exists() {
-        match DictFormat::sniff(out)? {
-            DictFormat::MtoolJson => {
-                return Err(Error::new(format!(
-                    "{} 是 MTool 词典（只读格式），wtool 不会往里写。\n\
-                     请给 wtool 自己的输出路径，例如一个新文件 `dict.tsv` 或 `dict.json`。",
-                    out.display()
-                )));
-            }
-            fmt => fmt, // wtool 自身格式，可续传。
-        }
+        DictFormat::sniff(out)?
     } else {
         DictFormat::parse_out(&cfg.dict_format)
     };
@@ -651,35 +691,36 @@ fn run_collecting(sink: &dyn Reporter, stop_rx: Receiver<()>) -> Result<()> {
     sink.say(format!("已有语料 {}", collector.stats()));
 
     // 注入方式和翻译模式同一套：桥照常把原文推上来，只是 wtool 不回译文。
-    let methods = inject::mechanisms(kind);
-    let mut injected = false;
-    for method in &methods {
-        let report = method.probe(Path::new(game_dir));
-        if report.state == State::NotApplicable {
-            sink.say(format!("{}：{}", method.name(), report.detail));
-            continue;
-        }
-        sink.say(format!("注入方式：{}（{}）", method.name(), report.detail));
-        for line in method.install(Path::new(game_dir), Path::new(dict_path), &cfg.font)? {
-            sink.say(line);
-        }
-        // 在线采集靠游戏侧把文本推上来；不需要常驻服务的注入方式（RGSS3）
-        // 从不回报文本，这条路对它不成立 —— 当场说清楚，别让用户对着
-        // 「正在监听」干等。RGSS3 收料请用「离线扫描」。
-        if !method.needs_server() {
-            return Err(Error::new(
-                "这个引擎的钩子不向 wtool 回报文本，在线采集不适用。请改用「离线扫描」收语料。",
-            ));
-        }
-        injected = true;
-        break;
-    }
-    if !injected {
+    // 采集只要「游戏侧往 wtool 推文本」这条路，也就是 TCP 那条 —— 一次性路不回报
+    // 文本、文件轮询路也只在游戏进程内查表，都对采集不成立。所以这里挑机制时
+    // 直接问 service，而不是按模式挑。
+    let mode = inject::resolve_mode(&cfg.run_mode, kind);
+    let Some(method) = inject::pick(kind, Path::new(game_dir), mode) else {
         return Err(Error::new(format!(
-            "{}（{}）上还没有可用的注入方式",
+            "{}（{}）上还没有可用的注入方式（{}模式）",
             kind.name(),
-            kind.runtime().name()
+            kind.runtime().name(),
+            mode.name()
         )));
+    };
+    if !matches!(method.service(), Service::Tcp) {
+        return Err(Error::new(
+            "这个引擎的钩子不向 wtool 回报文本，在线采集不适用。请改用「离线扫描」收语料。",
+        ));
+    }
+
+    for line in inject::uninstall_siblings(kind, Path::new(game_dir), method.id()) {
+        sink.say(line);
+    }
+    let report = method.probe(Path::new(game_dir));
+    sink.say(format!(
+        "注入方式：{}（{}模式，{}）",
+        method.name(),
+        mode.name(),
+        report.detail
+    ));
+    for line in method.install(Path::new(game_dir), Path::new(dict_path), &cfg.font)? {
+        sink.say(line);
     }
 
     let link = bind_with_retry(PORT, Duration::from_secs(1))?;

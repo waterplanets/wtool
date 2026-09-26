@@ -5,7 +5,7 @@
 //! ```text
 //!   format   认格式：这个文件是什么？（MTool / wtool 行式 / wtool JSON）
 //!     │
-//!     ├── mtool   读 MTool 的 TrsData.json（只读，外部契约）
+//!     ├── mtool   读写 MTool 的 TrsData.json（外部契约，写它属显式导出）
 //!     └── wtool   读 / 写 wtool 自己的两种格式
 //!          │
 //!          ▼

@@ -29,6 +29,9 @@ pub struct AppConfig {
     pub game_dir: String,
     pub dict_path: String,
     pub font: String,
+    /// 注入模式：`auto`（各引擎自己成熟的那条）/ `live`（实时连接 wtool）/
+    /// `onetime`（一次性注入，装完即终态）。空串/拼错一律归 `auto`。
+    pub run_mode: String,
     /// `gtx`（Google，免费零配置）或 `llm`（OpenAI 兼容）。
     pub translate_backend: String,
     pub corpus_path: String,
@@ -49,6 +52,7 @@ impl Default for AppConfig {
             game_dir: String::new(),
             dict_path: String::new(),
             font: String::new(),
+            run_mode: "auto".to_string(),
             translate_backend: "gtx".to_string(),
             corpus_path: String::new(),
             out_path: String::new(),
@@ -123,6 +127,11 @@ impl AppConfig {
         // 后端只认 gtx / llm 两个值，其余（含空串、拼错）一律按默认 gtx。
         if self.translate_backend.trim() != "llm" {
             self.translate_backend = "gtx".to_string();
+        }
+        // 注入模式只认 live / onetime，其余（含 auto、空串、拼错）归 auto。
+        match self.run_mode.trim() {
+            "live" | "onetime" => self.run_mode = self.run_mode.trim().to_string(),
+            _ => self.run_mode = "auto".to_string(),
         }
         if self.corpus_format.trim().is_empty() {
             self.corpus_format = "tsv".to_string();

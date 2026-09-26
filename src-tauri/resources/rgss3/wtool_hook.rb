@@ -3,11 +3,13 @@
 # wtool RGSS3 (VX Ace) 实时翻译 hook
 #------------------------------------------------------------------------------
 # 由 Patch/Patch.rb 末尾的 loader 用 eval 载入（NWPatch 机制，零注入）。
-# 词典：Patch/wtool_dict.tsv（UTF-8，每行「原文<TAB>译文」，# 开头为注释）
-# 日志：Patch/wtool_hook.log
 #
-# 卸载：删除 Patch/wtool_hook.rb 与 Patch/wtool_dict.tsv，
-#       并把 Patch/Patch.rb 用 Patch/Patch.rb.wtool-bak 覆盖回去。
+# 这一份源码同时服务两条注入路，差别只在下面那几行配置（由 wtool 安装时改写）：
+#   一次性：LIVE=false，词典烤成 Patch/wtool_dict.tsv，装完即终态。
+#   实时：  LIVE=true，  wtool 改写词典/字体文件，钩子每秒比一次 mtime 热重载。
+#
+# 卸载：见 src-tauri/src/engine/rgss3/{patch,live}.rs —— 删掉对应文件并把
+#       Patch/Patch.rb 用 Patch/Patch.rb.wtool-bak 覆盖回去（或就地摘掉 loader）。
 #
 # 挂载策略：全类扫描（照抄 MTool，见 .probe_rgss3/mtool_scripts/evalIBin_173.rb）
 #------------------------------------------------------------------------------
@@ -38,10 +40,27 @@
 #==============================================================================
 
 module WTool
-  VERSION   = "7"
+  VERSION = "9"
+
+  # ---- 安装时可替换的配置（wtool 按模式改写下面这几行）------------------------
+  #
+  # 一次性模式：LIVE=false。词典在安装时就转好烤在盘上，钩子开机读一次就完事，
+  #            wtool 关掉也照翻（装完即终态）。
+  # 实时模式：  LIVE=true。wtool 开着，把词典和字体写进这几个文件；钩子每秒比
+  #            一次 mtime，谁变了就地重载 —— **换字体不用重装**，这就是实时
+  #            模式存在的意义（调字体、试词典）。
+  #
+  # 注意：这几行的**字面形状**（等号两边的对齐空格）Rust 侧是按精确子串替换的，
+  # 改这里必须同步改 src-tauri/src/engine/rgss3/patch.rs 里对应的常量
+  # （LIVE_LINE / DICT_LINE / LOG_LINE / MISS_LINE / ERR_LINE / FONT_PATH_LINE）。
+  LIVE      = false
   DICT_PATH = "Patch/wtool_dict.tsv"
   LOG_PATH  = "Patch/wtool_hook.log"
   MISS_PATH = "Patch/wtool_miss.log"
+  ERR_PATH  = "Patch/wtool_hook.err"
+  FONT_PATH = ""
+  # ---------------------------------------------------------------------------
+
   # 「该翻但没翻出来」的原文落盘上限。这些串是照着游戏画面抄的，用户没法
   # 一条条打给我，所以让钩子自己记 —— 之后据此补词典。
   MISS_MAX  = 3000
@@ -98,6 +117,97 @@ module WTool
   @frag_warn = 0            # 已写出的片段回退告警条数（见 FRAG_LOG_MAX）
   @hits  = 0
   @sample_limit = 30        # 前 30 次命中写进日志，用来确认 hook 真的在工作
+  # ---- 实时模式（LIVE=true）用的状态 ----
+  @font_name = nil          # 从 FONT_PATH 读到的字体名；nil = 用源码里的 FONT_NAME
+  @dict_mtime = nil         # 词典文件的 mtime，用来判断要不要重载
+  @font_mtime = nil         # 字体文件的 mtime
+  @last_tick = 0            # 上次查文件的时刻（限流到每秒一次）
+
+  # 当前生效的字体名：字体文件优先，其次才是烤进源码的 FONT_NAME。
+  def self.font_name
+    n = @font_name
+    return n if n.is_a?(String) && !n.empty?
+    FONT_NAME
+  end
+
+  # 实时模式：挂 Graphics.update，每秒比一次词典/字体文件的 mtime。
+  # 一次性模式（LIVE=false）根本不装这个，钩子读完一次就完事。
+  def self.file_mtime(path)
+    return nil if path.nil? || path.empty?
+    File.exist?(path) ? File.mtime(path).to_f : nil
+  rescue Exception
+    nil
+  end
+
+  # 读字体文件并热更新。空内容 = 回退到默认字体（这样「清空字体」也传得进来）。
+  def self.read_font_file
+    return if FONT_PATH.nil? || FONT_PATH.empty?
+    return unless File.exist?(FONT_PATH)
+    name = File.open(FONT_PATH, "r:utf-8") { |f| f.read }.strip
+    name = FONT_NAME if name.empty?
+    return if name == @font_name
+    @font_name = name
+    apply_font_name
+    log "字体热更新为「#{name}」"
+  rescue Exception => e
+    log "字体热更新失败：#{e.class}: #{e.message}"
+  end
+
+  # 把当前字体设成全局默认：之后新建的 Font 都会用它。
+  # 不碰已有 Font 对象（那要等窗口重建），但界面标签、菜单大多会重建。
+  def self.apply_font_name
+    return unless defined?(Font)
+    n = font_name
+    return if n.nil? || n.empty?
+    begin
+      Font.default_name = n
+    rescue Exception
+    end
+  end
+
+  # 词典或字体文件变了就地重载。载词典前把片段缓存、译文缓存、最长键一并复位
+  #（词典换了，之前算出来的最长键和缓存都不作数了）。
+  def self.check_reload
+    if file_mtime(DICT_PATH) != @dict_mtime
+      @frag.clear
+      @trans.clear
+      @max_frag = 2
+      log "词典变化，重新载入……"
+      load_dict
+    end
+    if file_mtime(FONT_PATH) != @font_mtime
+      @font_mtime = file_mtime(FONT_PATH)
+      read_font_file
+    end
+  rescue Exception
+    nil
+  end
+
+  # Graphics.update 每秒会被调很多次，这里限流到一秒一次，免得每帧都去 stat。
+  def self.tick
+    now = Time.now.to_f
+    return if now - @last_tick < 1.0
+    @last_tick = now
+    check_reload
+  end
+
+  # 实时模式才装：把 tick 挂到 Graphics.update 上。
+  def self.install_tick
+    unless defined?(Graphics) && Graphics.respond_to?(:update)
+      log "警告：Graphics.update 不可用，实时热重载未启用"
+      return
+    end
+    class << Graphics
+      unless method_defined?(:wtool_orig_update)
+        alias_method :wtool_orig_update, :update
+        def update(*args, &blk)
+          WTool.tick
+          wtool_orig_update(*args, &blk)
+        end
+      end
+    end
+    log "实时热重载已启用（每秒查一次词典/字体）"
+  end
 
   def self.log(msg)
     File.open(LOG_PATH, "a:utf-8") do |f|
@@ -111,6 +221,8 @@ module WTool
   # ● 载入词典
   #--------------------------------------------------------------------------
   def self.load_dict
+    # 先记下 mtime：即使词典不存在/读失败也要记，否则实时模式下会每秒重试一遍。
+    @dict_mtime = file_mtime(DICT_PATH)
     unless File.exist?(DICT_PATH)
       log "词典不存在，跳过：#{DICT_PATH}"
       return false
@@ -431,7 +543,7 @@ module WTool
   # 会污染游戏配置（它后面可能还要读回来）。MTool 那版直接原地改并 slice 掉
   # 多余元素，会连字号一起丢掉，这里不跟。
   def self.sub_font(v)
-    n = FONT_NAME
+    n = font_name
     return v if n.nil? || n.empty?
     return n if v.is_a?(String)
     if v.is_a?(Array)
@@ -456,7 +568,7 @@ module WTool
       log "警告：Font 未定义，字体未替换"
       return
     end
-    return if FONT_NAME.nil? || FONT_NAME.empty?
+    return if font_name.nil? || font_name.empty?
 
     class << Font
       unless method_defined?(:wtool_orig_font_new)
@@ -484,10 +596,13 @@ module WTool
       end
     end
 
-    log "字体已替换为「#{FONT_NAME}」"
+    log "字体已替换为「#{font_name}」"
   end
 
   def self.install
+    # 实时模式：字体以 FONT_PATH 指向的文件为准，先读一次（读不到就回退 FONT_NAME）。
+    read_font_file if LIVE
+
     ok = load_dict
 
     install_font
@@ -563,6 +678,10 @@ module WTool
     end
 
     log "hook 安装完成 v#{VERSION}（词典 #{@dict.size} 条，#{ok ? '已载入' : '缺失'}）"
+
+    # 实时模式才装热重载：一次性模式读完这一次就是终态，没有轮询的必要。
+    install_tick if LIVE
+
     true
   end
 end
@@ -572,7 +691,7 @@ begin
   WTool.install
 rescue Exception => e
   begin
-    File.open("Patch/wtool_hook.err", "w:utf-8") do |f|
+    File.open(ERR_PATH, "w:utf-8") do |f|
       f.puts "#{e.class}: #{e.message}"
       f.puts e.backtrace
     end

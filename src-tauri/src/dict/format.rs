@@ -1,9 +1,10 @@
 //! 词典文件的格式识别与分发。
 //!
-//! wtool 现在能读三种词典文件，靠内容自己认，不让用户先选格式：
+//! wtool 现在能读写三种词典文件，读的时候靠内容自己认，不让用户先选格式：
 //!
 //! - **MTool 词典**（`TrsData.json`）：一个扁平的 `{"原文": "译文"}` JSON 对象。
-//!   这是外部契约，**只读不写** —— 写出去的文件不该冒充它。
+//!   这是外部契约，默认只用来读；但用户明确要「导出一份给 MTool 用的词典」
+//!   时也能写（见 [`DictFormat::write`]），只是得显式选，不会是默认。
 //! - **wtool 行式文本**（`.tsv`）：一行一条 `原文<TAB>译文`，可排序、可 diff、
 //!   能手改。
 //! - **wtool JSON**：带 `wtool` 版本标记的对象，词条在 `entries` 里。
@@ -54,22 +55,24 @@ impl DictFormat {
         }
     }
 
-    /// 存进配置 / 从前端传进来时用的短名。MTool 是只读外部契约，
-    /// 归到它真实的长相（JSON）那边，反正不会用它去写。
+    /// 存进配置 / 从前端传进来时用的短名。
     pub fn as_str(self) -> &'static str {
         match self {
+            DictFormat::MtoolJson => "mtool",
             DictFormat::WtoolTsv => "tsv",
-            DictFormat::MtoolJson | DictFormat::WtoolJson => "json",
+            DictFormat::WtoolJson => "json",
         }
     }
 
-    /// 用户选「输出格式」时用的短名 → 格式。只可能落回能写的两种：
-    /// `json` 就是 wtool JSON，其余（含空串）按行式文本 —— 默认零选择。
+    /// 用户选「输出格式」时用的短名 → 格式。
+    ///
+    /// `json` 是 wtool JSON、`mtool` 是 MTool 的扁平 JSON，其余（含空串）按
+    /// 行式文本 —— 默认零选择，保持 TSV 这个 wtool 自己的格式。
     pub fn parse_out(s: &str) -> Self {
-        if s.trim().eq_ignore_ascii_case("json") {
-            DictFormat::WtoolJson
-        } else {
-            DictFormat::WtoolTsv
+        match s.trim().to_ascii_lowercase().as_str() {
+            "json" => DictFormat::WtoolJson,
+            "mtool" => DictFormat::MtoolJson,
+            _ => DictFormat::WtoolTsv,
         }
     }
 
@@ -130,15 +133,13 @@ impl DictFormat {
     }
 
     /// 按这个格式写一个词典文件，返回写出去几条。
+    ///
+    /// 三种格式都能写。MTool 那个是外部契约，写它等于**显式导出**一份
+    /// 「MTool 读得回去」的词典 —— 只在用户主动选了它时才会走到这，
+    /// 绝不是默认行为。
     pub fn write(self, path: &Path, map: &BTreeMap<String, String>) -> Result<usize> {
         match self {
-            // MTool 的文件是全社区共用的外部契约，我们只读。
-            // 真写出去一份「长得像 MTool」的文件，别人拿去用会踩坑。
-            DictFormat::MtoolJson => Err(Error::new(format!(
-                "MTool 词典是只读格式，wtool 不会往里写。换成 {} 或 {} 再试。",
-                DictFormat::WtoolTsv.name(),
-                DictFormat::WtoolJson.name()
-            ))),
+            DictFormat::MtoolJson => mtool::write_index(path, map),
             DictFormat::WtoolTsv => wtool::write_tsv(path, map),
             DictFormat::WtoolJson => wtool::write_json(path, map),
         }
@@ -232,12 +233,36 @@ mod tests {
         assert!(msg.contains("MTool 词典"), "错误信息里要列支持哪些格式：{msg}");
     }
 
-    /// MTool 格式只读不写 —— 别让 wtool 产出一份冒充 MTool 的文件。
+    /// MTool 格式能显式写出，且写出去的东西还能被自己读回来（往返一致）。
     #[test]
-    fn mtool_format_is_read_only() {
-        let path = std::env::temp_dir().join("wtool_fmt_never_written.json");
-        let map = BTreeMap::new();
-        assert!(DictFormat::MtoolJson.write(&path, &map).is_err());
-        assert!(!path.exists(), "报错了就不该真的写出去");
+    fn mtool_format_roundtrips() {
+        let path = std::env::temp_dir().join(format!("wtool_fmt_write_{}.json", std::process::id()));
+
+        let mut map = BTreeMap::new();
+        map.insert("アイテム".to_string(), "道具".to_string());
+        // 空译文 = 未翻译，不该写出去。
+        map.insert("空の訳".to_string(), String::new());
+        assert_eq!(DictFormat::MtoolJson.write(&path, &map).unwrap(), 1);
+
+        // 写出来得是能被嗅探认成 MTool 的扁平 JSON。
+        assert_eq!(DictFormat::sniff(&path).unwrap(), DictFormat::MtoolJson);
+        let back = DictFormat::MtoolJson.load(&path).unwrap();
+        assert_eq!(back.get("アイテム").map(String::as_str), Some("道具"));
+        assert!(!back.contains_key("空の訳"), "空译文不该写出去");
+    }
+
+    /// `parse_out` 认得三个短名，且 `as_str` 与它互为逆运算。
+    #[test]
+    fn parse_out_roundtrips_as_str() {
+        for fmt in [
+            DictFormat::MtoolJson,
+            DictFormat::WtoolTsv,
+            DictFormat::WtoolJson,
+        ] {
+            assert_eq!(DictFormat::parse_out(fmt.as_str()), fmt);
+        }
+        // 空串和未知值落回默认的行式文本。
+        assert_eq!(DictFormat::parse_out(""), DictFormat::WtoolTsv);
+        assert_eq!(DictFormat::parse_out("JSON"), DictFormat::WtoolJson);
     }
 }

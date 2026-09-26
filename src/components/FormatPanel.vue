@@ -2,7 +2,7 @@
 //! 词典与格式页：另存为 / 换格式，以及看词表。
 //!
 //! 「另存为」是这个页面的主角，因为有两件事只有它能做：
-//!   · MTool 词典是只读契约 —— 想改它、想换格式，只能另存成 wtool 格式；
+//!   · 换个格式：把 MTool 词典、wtool 词典互相转，或导出一份 MTool 能读的词典；
 //!   · 语料换个格式不该重扫一遍游戏（RGSS3 那要读上 GB 的归档）。
 //!
 //! 转换只做「读进来、按目标格式写出去」，不改内容。
@@ -130,8 +130,9 @@ async function readDict() {
     <section class="card">
       <h2>词典另存为</h2>
       <p class="muted">
-        源文件可以是 MTool 词典 —— 那种是社区共用的只读格式，wtool 只读不写；
-        想改它、想给 wtool 接着往下翻，就另存成 wtool 格式。
+        源文件可以是 MTool 词典、wtool 词典或语料。选 MTool 那项会写出一份扁平 JSON
+        （<code v-pre>{"原文": "译文"}</code>），MTool 能直接读回去；选 wtool 的两项则
+        带上排序（TSV）或版本标记（JSON），方便继续翻译和 diff。
       </p>
 
       <PathField
@@ -147,7 +148,8 @@ async function readDict() {
           <span class="name">要转成</span>
           <select v-model="dictFmt">
             <option value="tsv">行式文本（TSV）—— 可排序、可 diff、能手改</option>
-            <option value="json">JSON —— 带 wtool 版本标记</option>
+            <option value="json">wtool JSON —— 带版本标记</option>
+            <option value="mtool">MTool 词典 —— 扁平 JSON，交回 MTool 用</option>
           </select>
         </label>
       </div>

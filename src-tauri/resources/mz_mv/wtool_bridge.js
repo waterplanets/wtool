@@ -16,6 +16,13 @@
  *      两个一起开会对同一处挂两次钩子。
  *   3. 先启动 wtool（它在 127.0.0.1:17989 听着），再启动游戏。
  *
+ * 一次性模式（baked，正式使用时用这个）：
+ *   安装器可以把整份词典和字体名直接烤进本文件 —— 替换文件顶部那两行标记
+ *   （`WTOOL_BAKED` 与 `WTOOL_BAKED_FONT`）里的初值。烤过之后游戏运行时
+ *   就不再连 wtool、也不需要 wtool 开着：查表全在本进程内用烤进来的词典
+ *   完成（三级退级，行为与 wtool 侧一致），字体也在启动时一并设好。
+ *   这一节是安装器自动生成的（`WTOOL_BAKED` 载荷），重装会覆盖手改内容。
+ *
  * 协议（一行一条 JSON，UTF-8，\n 分隔，两边改一处必须同步另一处）：
  *   游戏 → wtool
  *     {"ev":"hello","engine":"mz"}
@@ -35,8 +42,16 @@
  *   wtool.current()    当前对话框快照 { active, seq, lines, text }
  *   wtool.dictSize()   本地缓存了多少条译文
  *   wtool.clearDict()  清空本地缓存
- *   wtool.setDebug(false)  关掉控制台输出
+ *   wtool.setDebug(false)  关掉控制台输出与 DEBUG 级日志
+ *   wtool.logPath()    日志文件落在哪（null = 这个运行时落不了盘）
  *   wtool.resendAll()      把四批整表重新问一遍（wtool 后开的、或者换过词典时用）
+ *
+ * 日志：
+ *   落在 data 目录的上一级（MZ 是游戏根，MV 是 www/），装载时轮转一次，
+ *   只留最近 5 份（wtool.log / wtool.1.log … wtool.4.log），最老的那份直接删。
+ *   每行是「时间 级别 内容」，级别 DEBUG / INFO / WARN / ERROR；
+ *   DEBUG 只在 debug 开着时记（画布层落点、逐字绘制那些都在这儿），
+ *   INFO 及以上一直记。落盘目录用 wtool.logPath() 看。
  *
  * 已知取舍：
  *   - 菜单文字（道具/技能/存档…）不走「上报 → 回写」那条道，它渲染时同步取字，
@@ -56,7 +71,8 @@
  *     参数里、前面几条整批管道都碰不到的自定义菜单）挂在 drawText/drawTextEx
  *     上：画之前先查本地 dict，没见过的串攒一批问 wtool，回话到了让窗口重画。
  *     所以第一次翻开是日文、紧接着变中文；之后一直从 dict 同步取。
- *     刻意不挂 Bitmap.drawText —— 那是逐字画的落点，手里只有一个字符。
+ *     刻意不挂 Bitmap.drawText 做翻译 —— 那是逐字画的落点，手里只有一个字符。
+ *     （Bitmap.drawText 上挂着的是「绘制层记录」，只写日志、不改字。）
  *   - 某段对话「第一次」出现时，wtool 还没把译文送回来，画出来的仍是原文；
  *     等回写到达后本插件会让消息窗口重画一次，视觉上可能闪一下。
  *     之后同样的文本再出现，就会在画之前同步替换，不再闪。
@@ -77,18 +93,181 @@
 (function () {
     'use strict';
 
+    //-------------------------------------------------------------------------
+    // 一次性（baked）模式占位
+    //-------------------------------------------------------------------------
+    //
+    // 下面两行是给安装器准备的**整行**替换点：安装时把整份词典和字体名直接烤进
+    // 本文件，游戏运行时就不再连 wtool、也不需要 wtool 开着 —— 查表全在本进程内
+    // 完成（见文件后半段的 localTranslate 与 baked 分支）。
+    // 这两行必须各占一行、缩进固定 4 空格：安装器按整行做字符串替换，多一个字符
+    // 就换不上。
+    var WTOOL_BAKED = null;
+    var WTOOL_BAKED_FONT = '';
+
     var HOST = '127.0.0.1';
     var PORT = 17989;      // 必须和 Rust 侧 engine/link.rs 的 PORT 一致
     var RETRY_MS = 3000;
     var LOG = '[wtool] ';
 
-    // nwjs 的窗口里有完整 Node 集成，插件里能直接 require。
-    var net;
+    // 一次性模式判定：安装器把词典烤进上面那行占位后为真。为真时不连 wtool、
+    // 不起同步查表线程，所有「上报 → 等回话」的调用都改成进程内查表。
+    var baked = !!WTOOL_BAKED;
+    // 烤进来的词典里最长 key 的字符数（UTF-16 码元）：片段匹配的窗口上限。
+    var bakedMaxKey = 0;
+
+    //-------------------------------------------------------------------------
+    // 日志
+    //
+    // 两条腿：控制台 + 文件。文件落在 data 目录的上一级（MZ 是游戏根，MV 是 www/），
+    // 装载时轮转一次，只留最近 5 份（wtool.log / wtool.1.log … wtool.4.log），
+    // 最老的那份直接删。这样出问题时手里永远有最近五局的现场，又不会撑爆目录。
+    //
+    // 级别：DEBUG（只在 debug 开着时落盘）、INFO、WARN、ERROR。
+    // 同一条事件只走 log.*，别处不要再直写 console，否则文件里的时间线是断的。
+    //-------------------------------------------------------------------------
+
+    var LOG_FILE = 'wtool.log';
+    var LOG_KEEP = 5;          // 连当前这份在内，一共留 5 份
+    var logDir = null;
+    var logBuf = [];
+    var logTimer = 0;
+    var logBroken = false;     // 落盘失败只报一次，别把控制台刷爆
+
+    // 本插件自己的目录：别的路径全推不出来时的保底。插件本身就是 wtool
+    // 写到这儿来的，这个目录一定写得进去。
+    var logSelfDir = null;
     try {
-        net = require('net');
-    } catch (e) {
-        console.warn(LOG + '拿不到 Node 的 net 模块，桥未启动');
-        return;
+        var _scriptSrc = document.currentScript && document.currentScript.src;
+        if (_scriptSrc) {
+            var _s = decodeURIComponent(_scriptSrc).replace(/^[a-zA-Z][\w+.-]*:\/\/[^\/]*/, '');
+            // 去掉协议头后剩下 `/www/js/plugins/x.js` 这种（chrome-extension 启动
+            // 就是这样），前面补 cwd —— 实测 cwd 正是游戏根目录，拼得上。
+            if (!/^[A-Za-z]:/.test(_s)) {
+                var _cwd = '';
+                try { _cwd = String(process.cwd()).replace(/\\/g, '/').replace(/\/+$/, ''); } catch (e) {}
+                _s = _cwd + (_s.charAt(0) === '/' ? '' : '/') + _s;
+            }
+            logSelfDir = _s.replace(/\/[^\/]*$/, '');
+        }
+    } catch (e) {}
+
+    // 轮转：3→4、2→3、1→2、wtool.log→wtool.1，写之前目标先删掉，
+    // 于是最老的那份在第一步就被顶掉了。
+    function logRotate() {
+        var fs = NODE.fs;
+        function move(from, to) {
+            try {
+                if (!fs.existsSync(from)) return;
+                if (fs.existsSync(to)) fs.unlinkSync(to);
+                fs.renameSync(from, to);
+            } catch (e) {}
+        }
+        move(logDir + '/wtool.' + (LOG_KEEP - 2) + '.log', logDir + '/wtool.' + (LOG_KEEP - 1) + '.log');
+        for (var i = LOG_KEEP - 3; i >= 1; i--) {
+            move(logDir + '/wtool.' + i + '.log', logDir + '/wtool.' + (i + 1) + '.log');
+        }
+        move(logDir + '/wtool.log', logDir + '/wtool.1.log');
+    }
+
+    // 落哪个目录：候选按可信度排，逐个试写，第一个写得进去的就定下来，
+    // 定下来的那一刻顺手把上一局的 wtool.log 轮转走。
+    // 一个都写不进去也不影响游戏，只是文件这半边没有。
+    function logPickDir() {
+        if (logDir) return logDir;
+        if (!NODE) return null;
+
+        var cands = [];
+        var d = dataDir();
+        if (d) cands.push(d.replace(/[\/\\]data[\/\\]?$/, ''));
+        try { cands.push(String(process.cwd())); } catch (e) {}
+        try { cands.push(NODE.path.dirname(process.execPath)); } catch (e) {}
+        if (logSelfDir) cands.push(logSelfDir);
+
+        for (var i = 0; i < cands.length; i++) {
+            if (!cands[i]) continue;
+            var dir = String(cands[i]).replace(/\\/g, '/').replace(/\/+$/, '');
+            if (!dir) continue;
+            try {
+                NODE.fs.appendFileSync(dir + '/' + LOG_FILE, '');
+            } catch (e) {
+                continue;
+            }
+            logDir = dir;
+            logRotate();
+            return dir;
+        }
+        return null;
+    }
+
+    function logStamp() {
+        var d = new Date();
+        function p(n, w) { n = String(n); while (n.length < w) n = '0' + n; return n; }
+        return p(d.getFullYear(), 4) + '-' + p(d.getMonth() + 1, 2) + '-' + p(d.getDate(), 2)
+            + ' ' + p(d.getHours(), 2) + ':' + p(d.getMinutes(), 2) + ':' + p(d.getSeconds(), 2)
+            + '.' + p(d.getMilliseconds(), 3);
+    }
+
+    // 攒够一批再落盘：画字那条道上的记录是密集的，一句一次 appendFileSync 太亏。
+    function logPush(level, msg) {
+        logBuf.push(logStamp() + ' ' + level + ' ' + msg);
+        if (logBuf.length >= 64) logFlush();
+        else if (!logTimer) logTimer = setTimeout(logFlush, 200);
+    }
+
+    function logFlush() {
+        if (logTimer) { clearTimeout(logTimer); logTimer = 0; }
+        if (!logBuf.length) return;
+        var out = logBuf.join('\n') + '\n';
+        logBuf = [];
+        if (!logPickDir()) return;
+        try {
+            NODE.fs.appendFileSync(logDir + '/' + LOG_FILE, out);
+        } catch (e) {
+            if (!logBroken) {
+                logBroken = true;
+                console.error(LOG + '写日志失败：' + e);
+            }
+        }
+    }
+
+    var log = {
+        debug: function (msg) {
+            if (!debug) return;
+            console.log(LOG + msg);
+            logPush('DEBUG', msg);
+        },
+        info: function (msg) {
+            if (debug) console.log(LOG + msg);
+            logPush('INFO ', msg);
+        },
+        warn: function (msg, e) {
+            var m = e ? msg + '（' + (e.stack || e.message || e) + '）' : msg;
+            console.warn(LOG + m);
+            logPush('WARN ', m);
+        },
+        error: function (msg, e) {
+            var m = e ? msg + '（' + (e.stack || e.message || e) + '）' : msg;
+            console.error(LOG + m);
+            logPush('ERROR', m);
+        }
+    };
+
+    if (typeof window !== 'undefined') {
+        window.addEventListener('beforeunload', function () { try { logFlush(); } catch (e) {} });
+    }
+
+    // nwjs 的窗口里有完整 Node 集成，插件里能直接 require。
+    // baked 模式不连 wtool，压根用不上 net —— 这时候也不要因为拿不到 net 就把
+    // 整个插件退掉（有些运行时没有 Node 集成，baked 照样该能跑）。
+    var net = null;
+    if (!baked) {
+        try {
+            net = require('net');
+        } catch (e) {
+            log.warn('拿不到 Node 的 net 模块，桥未启动');
+            return;
+        }
     }
 
     //-------------------------------------------------------------------------
@@ -123,7 +302,7 @@
     // 自己锁死。所以查表那条连接必须**由另一个线程持有**，主线程只通过共享内存
     // 跟它对话。
     //
-    // 实测过的两件事（探针量完就删了）：
+    // 实测过的两件事：
     //   - 这条运行时里 worker_threads / SharedArrayBuffer / Atomics 都在，
     //     共享内存往返真的能跑通，稳态在微秒级；
     //   - 主线程的 Atomics.wait 被 Chrome 禁掉了（"cannot be called in this
@@ -148,7 +327,8 @@
     var syncSeq = 0;
     var syncFail = 0;
 
-    (function startSync() {
+    // baked 模式不连 wtool，同步查表线程没有对端，整条 IIFE 直接跳过。
+    if (!baked) (function startSync() {
         var wt;
         try {
             wt = require('worker_threads');
@@ -265,10 +445,10 @@
             // 付一次 Worker 冷启动（实测 23ms），正好卡在开场。
             new wt.Worker(src, { eval: true, workerData: { sab: sab, port: LOOKUP_PORT } });
             syncOn = true;
-            if (debug) console.log(LOG + '同步查表线程已起，端口 ' + LOOKUP_PORT);
+            log.info('同步查表线程已起，端口 ' + LOOKUP_PORT);
         } catch (e) {
             syncOn = false;
-            console.warn(LOG + '同步查表起不来，退回异步重画: ' + e.message);
+            log.warn('同步查表起不来，退回异步重画: ' + e.message);
         }
     })();
 
@@ -309,7 +489,7 @@
                 Atomics.store(syncCtrl, 0, 0);
                 if (++syncFail >= SYNC_MAX_FAIL) {
                     syncOn = false;
-                    console.warn(LOG + '同步查表连续 ' + syncFail + ' 次超时，本轮退回异步重画');
+                    log.warn('同步查表连续 ' + syncFail + ' 次超时，本轮退回异步重画');
                 }
                 return null;
             }
@@ -330,6 +510,9 @@
     //-------------------------------------------------------------------------
 
     function send(obj) {
+        // baked 模式：没有任何对端，所有「上报 → 等回话」的调用都在这儿成空操作，
+        // 各批文本改由各自的 send 函数就地本地查表（见 localMap）。
+        if (baked) return;
         if (!socket || socket.destroyed) return;
         try {
             socket.write(JSON.stringify(obj) + '\n');
@@ -360,7 +543,7 @@
             sendDbTexts();
             sendEventTexts();
             sendDuTexts();
-            if (debug) console.log(LOG + '已连上 ' + HOST + ':' + PORT);
+            log.info('已连上 ' + HOST + ':' + PORT);
         });
 
         s.on('data', function (chunk) {
@@ -378,7 +561,7 @@
 
         s.on('close', function () {
             if (socket === s) socket = null;
-            if (debug) console.log(LOG + '连接断开，' + RETRY_MS + 'ms 后重连');
+            log.info('连接断开，' + RETRY_MS + 'ms 后重连');
             setTimeout(connect, RETRY_MS);
         });
     }
@@ -446,6 +629,129 @@
     }
 
     //-------------------------------------------------------------------------
+    // 一次性（baked）模式的本地查表
+    //-------------------------------------------------------------------------
+    //
+    // 实时模式下查表是 wtool 干的：桥把原文发过去，wtool 用 Dict::translate
+    // 查完回写，桥把结果记进 dict。baked 模式没有 wtool，这里就得自己在进程内
+    // 把同一套三级退级做一遍，结果才一致。
+    //
+    // **必须与 Rust 侧 src-tauri/src/dict/mtool.rs 的 Dict::translate / fragments
+    // 行为保持一致**：两边吃的是同一份词典，结果不该分叉。
+    //   1. 整段精确（空译文视为未命中）；
+    //   2. 剥掉控制码（\c[2]、\i[127]、\v[10] 这类）后 trim，再精确查一次；
+    //   3. 片段最长优先匹配。
+    // 多行文本按 \n 拆开逐行退级再拼回 —— 对应 Rust 的「整段 → 单行」退级，
+    // 能翻几行算几行，不是全有全无。
+
+    // 纯 ASCII 判断。片段匹配不拿纯 ASCII 的 key 去啃句子（Rust 侧 fragments
+    // 里的 `s.is_ascii()`）：词典里 "10" -> "用10" 这种脏数据会把游戏里的
+    // \V[1001] 改成 \V[用1001]，引擎解析不出来就原样甩屏，玩家看到的是乱码。
+    function isPlainAscii(s) {
+        for (var i = 0; i < s.length; i++) {
+            if (s.charCodeAt(i) > 0x7f) return false;
+        }
+        return true;
+    }
+
+    // 片段替换：最长优先、从左往右。扫到哪一格就在那儿试「以它开头、词典里真
+    // 有的长度」，从窗口上限（bakedMaxKey，即词典里最长 key 的字符数）往下试，
+    // 中一个就整段替换、指针跳过这么多字符；一个都不中就原样搬走一个字符。
+    // 一个能用的片段都没找到时返回 null。
+    function localFragments(line) {
+        var n = line.length;
+        var out = '';
+        var any = false;
+        var c = 0;
+        while (c < n) {
+            var hit = null;
+            var hitLen = 0;
+            var max = Math.min(bakedMaxKey, n - c);
+            for (var k = max; k >= 2; k--) {
+                var s = line.substr(c, k);
+                if (isPlainAscii(s)) continue;
+                var t = dict[s];
+                if (!t) continue;
+                // 「短键长译」：key 两三个字、译文却是一整句，是词典里错位的脏
+                // 数据（绘制层串位存进去的那种）。吃了它等于把整句塞进单词中
+                // 间，跳过、原样推进一格才是干净结果。守卫与 Rust 侧一致。
+                if (t.length >= 8 && t.length >= k * 4) continue;
+                hit = t;
+                hitLen = k;
+                break;
+            }
+            if (hit) {
+                out += hit;
+                any = true;
+                c += hitLen;
+            } else {
+                out += line.charAt(c);
+                c += 1;
+            }
+        }
+        return any ? out : null;
+    }
+
+    // 单行退级：精确 → 剥控制码后精确 → 片段。返回译文或 null。
+    function localLine(line) {
+        var t = dict[line];
+        if (t) return t;
+        // 剥控制码用的是全文件同一个 strip（visible），和 Rust 侧
+        // corpus::strip_controls 一个意思：\c[2]、\i[127]、\v[10] 之类摘掉，
+        // 剩下的可见字再 trim 一次去查。
+        var s = visible(line);
+        if (s && s !== line) {
+            t = dict[s];
+            if (t) return t;
+        }
+        return localFragments(line);
+    }
+
+    // 三级退级查一段文本，返回译文或 null（一个字都没翻上就是 null）。
+    function localTranslate(text) {
+        if (typeof text !== 'string' || !text) return null;
+
+        // 第一级：整段精确。
+        var t = dict[text];
+        if (t) return t;
+        // 补一级：整段剥控制码后精确。控制码不进词典的 key，带码的整段
+        // 只有这一退能中。
+        var plain = visible(text);
+        if (plain && plain !== text) {
+            t = dict[plain];
+            if (t) return t;
+        }
+
+        // 第二、三级：逐行退级，能翻几行算几行。
+        var lines = text.split('\n');
+        var out = [];
+        var any = false;
+        for (var i = 0; i < lines.length; i++) {
+            t = localLine(lines[i]);
+            if (t) {
+                out.push(t);
+                any = true;
+            } else {
+                out.push(lines[i]);
+            }
+        }
+        return any ? out.join('\n') : null;
+    }
+
+    // baked 模式把一批原文就地查成「原文 → 译文」的 map（只放查得到的）。
+    // exactOnly 为真走精确查（菜单词条那批的语义），否则走三级退级。
+    function localMap(texts, exactOnly) {
+        var map = Object.create(null);
+        for (var i = 0; i < texts.length; i++) {
+            var s = texts[i];
+            if (typeof s !== 'string' || !s || map[s]) continue;
+            var t = exactOnly ? dict[s] : localTranslate(s);
+            if (t) map[s] = t;
+        }
+        return map;
+    }
+
+    //-------------------------------------------------------------------------
     // 写访问：wtool 回写的译文落到这里
     //-------------------------------------------------------------------------
 
@@ -485,7 +791,7 @@
             var win = scene ? scene._messageWindow : null;
             if (win) _startMessage.call(win);
         } catch (e) {
-            console.error(LOG + '重画失败', e);
+            log.error('重画失败', e);
         }
     }
 
@@ -578,7 +884,7 @@
         // 再往上报一次，wtool 会拿中文当原文去查词典，片段匹配能把它改出鬼来。
         // 所以认出来就原地不动 —— 屏幕上本来就是对的。
         if (isTranslated(text)) {
-            if (debug) console.log(LOG + '已是译文，跳过', text);
+            log.debug('已是译文，跳过 ' + text);
             return;
         }
 
@@ -623,7 +929,7 @@
         var spk = $gameMessage._speakerName;
         if (spk && dict[spk]) $gameMessage._speakerName = dict[spk];
 
-        if (debug) console.log(LOG + '#' + state.seq + (state.shown !== text ? ' 已译' : ' 原文'), text);
+        log.debug('#' + state.seq + (state.shown !== text ? ' 已译' : ' 原文') + ' ' + text);
         send(textEvent());
     }
 
@@ -635,9 +941,15 @@
     }
 
     // 对话是逐字画的，不能挂 drawText；startMessage 里 _texts 才是完整的整句。
+    // 顺手记一笔落点：回想里的地の文若走普通消息，日志里一定看得见，
+    // 看不见就说明它根本不走消息窗口。
     var _startMessage = Window_Message.prototype.startMessage;
     Window_Message.prototype.startMessage = function () {
         onOpen();
+        try {
+            var all = $gameMessage.allText() || '';
+            if (all) drawLogWin('消息 startMessage', all, null);
+        } catch (e) {}
         return _startMessage.apply(this, arguments);
     };
 
@@ -688,7 +1000,7 @@
         };
     } catch (e) {
         // 装不上就退回原样：缺字虽然难看，但比游戏起不来强。
-        console.warn(LOG + '字体补丁没装上', e);
+        log.warn('字体补丁没装上', e);
     }
 
     //-------------------------------------------------------------------------
@@ -717,7 +1029,7 @@
         targetFont = next;
         // 已经画出去的字不会自己变，让消息窗口先跟上；其余窗口下次刷新自然生效。
         if (state.active) repaint();
-        if (debug) console.log(LOG + '目标字体：' + (targetFont || '（游戏原字体）'));
+        log.info('目标字体：' + (targetFont || '（游戏原字体）'));
     }
 
     //-------------------------------------------------------------------------
@@ -773,8 +1085,15 @@
     function sendTerms() {
         var texts = collectTerms();
         if (!texts) return;   // 数据库还没载入，等 onDatabaseLoaded 再叫一次
+        // baked 模式：不经过 socket，就地精确查一遍再原地改写 $dataSystem.terms。
+        // 菜单词条是渲染时同步取字，走精确查（不用退级，理由见 Rust 的 exact）。
+        if (baked) {
+            applyTerms(localMap(texts, true));
+            log.info('菜单词表 ' + texts.length + ' 条，本地查表完成');
+            return;
+        }
         send({ ev: 'terms', label: '菜单词条', texts: texts });
-        if (debug) console.log(LOG + '菜单词表 ' + texts.length + ' 条，已问 wtool');
+        log.info('菜单词表 ' + texts.length + ' 条，已问 wtool');
     }
 
     // 把 wtool 回的「原文 → 译文」原地写进 $dataSystem.terms，返回改了几条。
@@ -804,7 +1123,7 @@
                 }
             }
         }
-        if (debug) console.log(LOG + '菜单词条已替换 ' + n + ' 条');
+        log.info('菜单词条已替换 ' + n + ' 条');
         return n;
     }
 
@@ -893,8 +1212,14 @@
     function sendDbTexts() {
         var texts = collectDbTexts();
         if (!texts.length) return;   // 数据库还没载入，等 onDatabaseLoaded 再叫一次
+        // baked 模式：和实时模式一样走三级退级（loose），只是改成本地查。
+        if (baked) {
+            applyDbTexts(localMap(texts, false));
+            log.info('数据库文本 ' + texts.length + ' 条，本地查表完成');
+            return;
+        }
         send({ ev: 'terms', loose: true, label: '数据库文本', texts: texts });
-        if (debug) console.log(LOG + '数据库文本 ' + texts.length + ' 条，已问 wtool');
+        log.info('数据库文本 ' + texts.length + ' 条，已问 wtool');
     }
 
     // 这两张表的 `name` 不能改写：这个游戏拿名字当**键**。
@@ -953,7 +1278,7 @@
             }
         }
 
-        if (debug) console.log(LOG + '数据库文本已替换 ' + n + ' 条');
+        log.info('数据库文本已替换 ' + n + ' 条');
         return n;
     }
 
@@ -984,23 +1309,28 @@
     function dataDir() {
         if (!NODE) return null;
 
-        var cands = [];
+        var bases = [];
         try {
             var p = decodeURIComponent(window.location.pathname || '');
-            if (/^\/[A-Za-z]:/.test(p)) p = p.slice(1);   // /D:/… → D:/…
-            cands.push(p.replace(/\/[^\/]*$/, ''));
+            // 只有拿得到绝对路径才值得当候选。游戏以 chrome-extension://<id>/www/…
+            // 启动时 pathname 只有 `/www/index.html`，没盘符 —— 拿它去拼 data 是白搭，
+            // 之前就是这样三个候选全落空、dataDir 返回 null，地图扫描整条路死掉。
+            if (/^\/[A-Za-z]:/.test(p)) bases.push(p.slice(1));
+            else if (/^[A-Za-z]:/.test(p)) bases.push(p);
         } catch (e) {}
-        cands.push(process.cwd());
-        try {
-            cands.push(NODE.path.dirname(process.execPath));
-        } catch (e) {}
+        try { bases.push(process.cwd()); } catch (e) {}
+        try { bases.push(NODE.path.dirname(process.execPath)); } catch (e) {}
 
-        for (var i = 0; i < cands.length; i++) {
-            if (!cands[i]) continue;
-            var d = String(cands[i]).replace(/\\/g, '/') + '/data';
-            try {
-                if (NODE.fs.existsSync(d)) return d;
-            } catch (e) {}
+        // MV 的 data 在 www/ 下，MZ 就在根上，两种都试。
+        for (var i = 0; i < bases.length; i++) {
+            if (!bases[i]) continue;
+            var base = String(bases[i]).replace(/\\/g, '/').replace(/\/+$/, '');
+            var tries = [base + '/data', base + '/www/data'];
+            for (var j = 0; j < tries.length; j++) {
+                try {
+                    if (NODE.fs.existsSync(tries[j])) return tries[j];
+                } catch (e) {}
+            }
         }
         return null;
     }
@@ -1131,8 +1461,16 @@
     function sendEventTexts() {
         var texts = collectEventTexts();
         if (!texts.length) return;
+        // baked 模式：这批没有「直接改写」的对象（选项/人名/地图名都是渲染时从
+        // dict 同步取字），效果就是把译文并进 dict —— 实时模式回话后走的也是
+        // handle 里的 mergeDict。loose 语义不变，改成本地三级退级。
+        if (baked) {
+            mergeDict(localMap(texts, false));
+            log.info('事件文本 ' + texts.length + ' 条，本地查表完成');
+            return;
+        }
         send({ ev: 'terms', loose: true, label: '事件文本', texts: texts });
-        if (debug) console.log(LOG + '事件文本 ' + texts.length + ' 条，已问 wtool');
+        log.info('事件文本 ' + texts.length + ' 条，已问 wtool');
     }
 
     // 选项：Window_ChoiceList 是从 $gameMessage._choices 取字画的，在它
@@ -1212,6 +1550,9 @@
     }
 
     function learnDrawn(text) {
+        // baked 模式不回话，也没有「回话到了再重画」那一趟：translateDrawn 已经
+        // 同步给出译文，这里什么都不用攒。
+        if (baked) return;
         if (!socket || socket.destroyed) return;   // 还没连上，问了也没人接
         if (askedDrawn[text] || !worthAsking(text)) return;
         askedDrawn[text] = true;
@@ -1225,8 +1566,16 @@
         for (var k in pendingDrawn) texts.push(k);
         pendingDrawn = Object.create(null);
         if (!texts.length) return;
+        // baked 模式：本地三级退级后并进 dict（translateDrawn 之后的命中就靠它），
+        // 再让窗口重画。learnDrawn 在 baked 下不攒批，正常到不了这里。
+        if (baked) {
+            mergeDict(localMap(texts, false));
+            refreshWindows();
+            log.info('窗口文本 ' + texts.length + ' 条，本地查表完成');
+            return;
+        }
         send({ ev: 'terms', loose: true, label: '窗口文本', texts: texts });
-        if (debug) console.log(LOG + '窗口文本 ' + texts.length + ' 条，已问 wtool');
+        log.info('窗口文本 ' + texts.length + ' 条，已问 wtool');
     }
 
     // 画之前把整串换掉。dict 里有就换，没有就**当场同步问一次**（见 syncLookup），
@@ -1236,6 +1585,19 @@
         if (typeof text !== 'string' || !text) return text;
         var hit = dict[text];
         if (hit) return hit;
+        // baked 模式：没有 wtool 可问，直接本地三级退级，命中当场就是译文。
+        if (baked) {
+            // translated 里的是我们自己写出去的译文，别再翻一遍 —— 片段匹配
+            // 会把中文改出鬼来（和 worthAsking 的守卫同理）。
+            if (translated[text]) return text;
+            hit = localTranslate(text);
+            if (hit) {
+                dict[text] = hit;
+                translated[hit] = true;
+                return hit;
+            }
+            return text;
+        }
         if (worthAsking(text)) {
             hit = syncLookup(text);
             if (hit) {
@@ -1271,11 +1633,13 @@
 
     var _winDrawText = Window_Base.prototype.drawText;
     Window_Base.prototype.drawText = function (text, x, y, maxWidth, align) {
+        try { drawLogWin('win.drawText', text, this); } catch (e) {}
         return _winDrawText.call(this, translateDrawn(text), x, y, maxWidth, align);
     };
 
     var _winDrawTextEx = Window_Base.prototype.drawTextEx;
     Window_Base.prototype.drawTextEx = function (text, x, y, width) {
+        try { drawLogWin('win.drawTextEx', text, this); } catch (e) {}
         return _winDrawTextEx.call(this, translateDrawn(text), x, y, width);
     };
 
@@ -1331,6 +1695,176 @@
         }
         return st;
     };
+
+    //-------------------------------------------------------------------------
+    // 绘制层记录
+    //-------------------------------------------------------------------------
+    //
+    // 为什么还要挂这一层：回想场景里叠在 CG 上的地の文不走 startMessage，也不走上面
+    // 那两个 Window_Base 钩子，所以本插件原有的钩子完全看不见它。MTool 能翻是因为它
+    // 本来就站在画布层（DLL 注入 + 在游戏的 V8 里编译执行 JS），代价是词典只能是
+    // 片段级。
+    //
+    // 这一层只记录、不改字，全部走 log.debug，用来回答三个问题：
+    //   1. 那几行是「一行一次 drawText」画的，还是逐字画的？
+    //   2. 承载它的 Bitmap 是每帧新建，还是一直重用？
+    //   3. 它是走引擎的 Bitmap.drawText，还是绕过引擎直接 fillText？
+    // 同一串只记一次，所以日志的量由游戏内容决定，不会随时间涨。
+    //-------------------------------------------------------------------------
+
+    var drawSeen = Object.create(null);
+    var drawChars = Object.create(null);   // 逐字绘制按 Bitmap 累计，不逐条记栈
+    var drawBid = 0;                       // 给每张 Bitmap 编个号，才看得出「是不是同一张」
+    var drawDrawing = false;               // 正在走我们的 drawText：期间的 fillText 不算「绕过」
+    var DRAW_CHAR_N = 8;                   // 单张 Bitmap 攒够这么多单字才记一条
+
+    // 当前场景名。「这串字是谁画的」除了调用来源，在哪个场景画的也是一半答案 ——
+    // 回想场景多半有自己的 Scene 类，名字一出来就知道该去哪儿找。
+    function drawScene() {
+        try {
+            var s = typeof SceneManager !== 'undefined' && SceneManager._scene;
+            return (s && s.constructor && s.constructor.name) || '?';
+        } catch (e) { return '?'; }
+    }
+
+    // 这条串在词典里属于哪种情况，补词典时直接看这一栏。
+    function drawVerdict(text) {
+        if (dict[text]) return 'dict已有';
+        if (!visible(text)) return '纯控制码';
+        return worthAsking(text) ? '词典无' : '不该问';
+    }
+
+    // 取调用来源。跳过栈头、本文件自己的帧、以及 rpg_core 里 drawText 的内部帧，
+    // 第一条剩下的就是真正发起这次绘制的地方（插件文件名一眼可辨）。
+    // 保留 rpg_windows.js 的帧 —— 它出现就说明走的是引擎自己的窗口绘制。
+    function drawCaller() {
+        var st = '';
+        try { st = new Error().stack || ''; } catch (e) { return '?'; }
+        var ls = st.split('\n');
+        for (var i = 0; i < ls.length; i++) {
+            // 按函数名再挡一道我们自己的帧：它们在栈最前面，只按文件名挡会漏。
+            if (/draw(Caller|LogText)/.test(ls[i])) continue;
+            var s = ls[i].replace(/^\s*at\s+/, '').trim();
+            if (!s || /^Error/.test(s)) continue;
+            if (s.indexOf('wtool_bridge.js') >= 0) continue;
+            if (s.indexOf('rpg_core.js') >= 0) continue;
+            return s.slice(0, 160);
+        }
+        return '?';
+    }
+
+    function drawLogText(text, bmp) {
+        if (!text) return;
+        var bid = bmp.__wtoolBid;
+        if (!bid) bid = bmp.__wtoolBid = (++drawBid);
+
+        // 逐字绘制：每帧上千次，记栈会拖慢游戏，所以按 Bitmap 累计，
+        // 攒够一批才落一条 —— 认得出「这是逐字画的、画的是哪一行」就够了。
+        if (text.length < 2) {
+            var c = drawChars[bid];
+            if (!c) {
+                c = drawChars[bid] = {
+                    n: 0, w: bmp.width || 0, h: bmp.height || 0,
+                    acc: '', sc: drawScene(), done: false
+                };
+            }
+            c.n++;
+            if (c.acc.length < 80) c.acc += text;
+            if (!c.done && c.n >= DRAW_CHAR_N) {
+                c.done = true;
+                log.debug('绘制 逐字 bid=' + bid + ' ' + c.w + 'x' + c.h
+                    + ' 场景=' + c.sc + ' 串=' + JSON.stringify(c.acc));
+            }
+            return;
+        }
+
+        drawRecord(bid + '\u0000' + text, 'drawText',
+            'bid=' + bid + ' ' + (bmp.width || 0) + 'x' + (bmp.height || 0), text);
+    }
+
+    // 统一的落点记录：同一处（key）只记一次，量由游戏内容决定，不会随时间涨。
+    function drawRecord(key, kind, where, text) {
+        if (drawSeen[key]) return;
+        drawSeen[key] = true;
+        log.debug('绘制 ' + kind + ' ' + where + ' len=' + text.length + ' ' + drawVerdict(text)
+            + ' 场景=' + drawScene() + ' ' + JSON.stringify(text) + ' ← ' + drawCaller());
+    }
+
+    // 窗口层的整串绘制（上面那两个钩子本来就挂了，这里只多记一句）。要回答的是：
+    // 「那段字到底有没有走到我们的钩子」以及「走到了的话，词典里到底有没有这条 key」。
+    function drawLogWin(kind, text, win) {
+        if (typeof text !== 'string' || !text) return;
+        drawRecord(kind + '\u0000' + text, kind,
+            'win=' + ((win && win.constructor && win.constructor.name) || '?'), text);
+    }
+
+    // 关窗/切场景时把攒着没收尾的逐字汇总补上，不然最后一行的现场就丢了。
+    if (typeof window !== 'undefined') {
+        window.addEventListener('beforeunload', function () {
+            try {
+                for (var bid in drawChars) {
+                    var c = drawChars[bid];
+                    if (c.done) continue;
+                    c.done = true;
+                    log.debug('绘制 逐字 bid=' + bid + ' ' + c.w + 'x' + c.h
+                        + ' n=' + c.n + ' 场景=' + c.sc + ' 串=' + JSON.stringify(c.acc));
+                }
+                logFlush();
+            } catch (e) {}
+        });
+    }
+
+    var _bmpDrawText = Bitmap.prototype.drawText;
+    Bitmap.prototype.drawText = function (text) {
+        try { drawLogText(typeof text === 'string' ? text : String(text), this); } catch (e) {}
+        // 置标记要包住原始调用：drawText 内部会走 _drawTextBody → fillText，
+        // 那几次是引擎自己的路径，别被 fillText 那个钩子当成「绕过引擎」。
+        drawDrawing = true;
+        try {
+            return _bmpDrawText.apply(this, arguments);
+        } finally {
+            drawDrawing = false;
+        }
+    };
+
+    // 绕过引擎直接往画布上画字的，只有在这层才抓得到。
+    if (typeof CanvasRenderingContext2D !== 'undefined') {
+        var _bmpFillText = CanvasRenderingContext2D.prototype.fillText;
+        CanvasRenderingContext2D.prototype.fillText = function (text) {
+            if (!drawDrawing && typeof text === 'string' && text.length >= 2) {
+                try { drawRecord('f\u0000' + text, 'fillText', 'ctx 绕过drawText', text); } catch (e) {}
+            }
+            return _bmpFillText.apply(this, arguments);
+        };
+    }
+
+    // 動的文字列ピクチャ（DTextPicture）：把一整块文字**逐字**画进一张新 Bitmap。
+    // 这条道既不进消息窗口、也不进 Window_Base —— 叠在 CG 上的回想文字若走这里，
+    // 现有的钩子确实一条都碰不到。这里把准备画的那整块文字原样记下来。
+    if (typeof Sprite_Picture !== 'undefined' && Sprite_Picture.prototype.makeDynamicBitmap) {
+        var _bmpDynBmp = Sprite_Picture.prototype.makeDynamicBitmap;
+        Sprite_Picture.prototype.makeDynamicBitmap = function () {
+            try {
+                var info = this.dTextInfo;
+                if (info && info.value) {
+                    drawRecord('dtext\u0000' + info.value, 'DTextPicture',
+                        'pic ' + (info.size || 0) + 'px', info.value);
+                }
+            } catch (e) {}
+            return _bmpDynBmp.apply(this, arguments);
+        };
+    }
+
+    // 装载心跳。放在最后：钩子都挂上了再落这一行，日志里有它才说明这一层确实在跑。
+    // 整段都不许把游戏本体拖下水，所以这一下也包住。
+    try {
+        var bootCwd = '?';
+        try { bootCwd = process.cwd(); } catch (e) {}
+        log.info('桥已装载 · data=' + (dataDir() || '(认不出来)') + ' · cwd=' + bootCwd
+            + ' · 日志=' + (logPickDir() || '(落不了盘，只有控制台)'));
+    } catch (e) {
+        console.error(LOG + '装载记录失败：' + e);
+    }
 
     // 这两张表都是数据库载入时才有的（$dataSystem 和 $dataItems 一起载入），
     // 这是唯一能保证它们已经存在的时机。但那一刻 socket 未必连上了，
@@ -1474,8 +2008,14 @@
     function sendDuTexts() {
         var texts = collectDuTexts();
         if (!texts.length) return;   // $DU 还没载入，等 onUniqueDataLoad 再叫一次
+        // baked 模式：和实时模式一样走三级退级（loose），改成本地查后原地写回。
+        if (baked) {
+            applyDuTexts(localMap(texts, false));
+            log.info('独特数据 ' + texts.length + ' 条，本地查表完成');
+            return;
+        }
         send({ ev: 'terms', loose: true, label: '独特数据', texts: texts });
-        if (debug) console.log(LOG + '独特数据 ' + texts.length + ' 条，已问 wtool');
+        log.info('独特数据 ' + texts.length + ' 条，已问 wtool');
     }
 
     // 把译文原地写回 SD 与 HeroineTalk。和上面几批一样，查不到的原样留着。
@@ -1529,7 +2069,7 @@
             }
         }
 
-        if (debug) console.log(LOG + '独特数据已替换 ' + n + ' 条');
+        log.info('独特数据已替换 ' + n + ' 条');
         return n;
     }
 
@@ -1560,6 +2100,10 @@
         setDebug: function (on) {
             debug = !!on;
         },
+        logPath: function () {
+            var d = logPickDir();
+            return d ? d + '/' + LOG_FILE : null;
+        },
         resendAll: function () {
             sendTerms();
             sendDbTexts();
@@ -1571,5 +2115,18 @@
         }
     };
 
-    connect();
+    if (baked) {
+        // 一次性（baked）模式：词典与字体在安装时就烤进了本文件（见文件顶部那两行
+        // 占位），游戏运行全程不连 wtool。这里把烤进来的词典并进本地 dict，记下
+        // 最长 key 用于片段匹配的窗口上限，字体也一并设好；socket 与同步查表线程
+        // 一律不起。之后各批文本由各自的 send 函数就地本地查表。
+        var bakedCount = mergeDict(WTOOL_BAKED);
+        for (var bakedKey in WTOOL_BAKED) {
+            if (bakedKey.length > bakedMaxKey) bakedMaxKey = bakedKey.length;
+        }
+        if (WTOOL_BAKED_FONT) setFont(WTOOL_BAKED_FONT);
+        log.info('一次性模式：词典 ' + bakedCount + ' 条已烤入，不连接 wtool');
+    } else {
+        connect();
+    }
 })();

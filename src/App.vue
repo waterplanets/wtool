@@ -1,13 +1,14 @@
 <script setup lang="ts">
 //! 应用外壳：左侧导航 + 右侧内容 + 底部日志。
 //!
-//! 五个页面的分工是照着「用户实际要干的事」分的，不是照着代码模块分的：
+//! 六个页面的分工是照着「用户实际要干的事」分的，不是照着代码模块分的：
 //!
 //!   翻译      —— 主流程（选游戏 → 选词典 → 开始），一体化，不问引擎
 //!   采集语料  —— 攒原文（在线采集 / 离线扫描）
 //!   离线翻译  —— 语料翻成词典（唯一能断点续传的地方）
 //!   词典与格式 —— 另存为 / 换格式、看词表
 //!   高级      —— 注入方式手动档、启动脚本、东西都存在哪
+//!   关于      —— 许可、第三方依赖、文件位置、免责声明
 //!
 //! 日志是全局面板而不是某一页的东西：三个任务都可能往它写，用户来回切页也
 //! 不该把日志丢了。
@@ -19,6 +20,7 @@ import CollectPanel from "./components/CollectPanel.vue";
 import FlowPanel from "./components/FlowPanel.vue";
 import FormatPanel from "./components/FormatPanel.vue";
 import OfflinePanel from "./components/OfflinePanel.vue";
+import AboutPanel from "./components/AboutPanel.vue";
 import { init, engine, error, logs, running, stop } from "./store";
 
 const TABS = [
@@ -27,6 +29,7 @@ const TABS = [
   { id: "offline", label: "离线翻译", hint: "语料 → 词典", view: markRaw(OfflinePanel) },
   { id: "format", label: "词典与格式", hint: "另存为 / 看词表", view: markRaw(FormatPanel) },
   { id: "advanced", label: "高级", hint: "注入 / 脚本 / 路径", view: markRaw(AdvancedPanel) },
+  { id: "about", label: "关于", hint: "许可与声明", view: markRaw(AboutPanel) },
 ];
 
 const active = ref("flow");

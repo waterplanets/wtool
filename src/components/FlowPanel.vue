@@ -15,7 +15,6 @@ import {
   engine,
   engineKnown,
   activeMethod,
-  needsServer,
   fontOptions,
   outcome,
   running,
@@ -29,9 +28,51 @@ import {
 /** 生启动脚本的结果（一行提示），贴在按钮下面。 */
 const launcherMsg = ref("");
 
+/** 模式选项。「自动」按引擎自己成熟的那条走，不纠结选哪个。 */
+const MODES = [
+  { value: "auto", label: "自动（推荐）" },
+  { value: "live", label: "实时连接 wtool（调字体用）" },
+  { value: "onetime", label: "一次性注入（正式玩用）" },
+];
+
+/** 当前注入方式靠什么维持通道；没有可用方式时为 null。 */
+const service = computed(() => activeMethod.value?.service ?? null);
+
+/** 当前模式的说明，选模式时给一句解释。 */
+const modeHint = computed(() => {
+  const svc = service.value;
+  if (!svc) return "这个模式下没有可用的注入方式，换一个试试。";
+  if (svc === "file_sync") {
+    return "实时：wtool 开着，改字体一秒内同步进游戏，不用重装。调试字体、试词典用这条。";
+  }
+  if (svc === "tcp") {
+    return "实时：wtool 开着，词典留在 wtool 这边（不用把大词典写进游戏）。调试字体、试词典用这条。";
+  }
+  return "一次性：词典与字体拷进游戏目录，装完即终态，wtool 可以关。正式玩用这条。";
+});
+
+/** 开始按钮的文案：要服务的说「开始翻译」，装完即终态的说「安装并完成」。 */
+const startLabel = computed(() =>
+  service.value === "none" ? "安装并完成" : "开始翻译",
+);
+
+/** 字体这一段怎么提示，取决于当前模式能不能热更。 */
+const fontHint = computed(() => {
+  if (service.value === "file_sync") {
+    return "实时模式下改字体即时生效：游戏开着也没关系，一秒内跟着变，不用重装、不用重启游戏。";
+  }
+  if (service.value === "tcp") {
+    return "改字体后需要重新点一次「开始」（wtool 会把新字体推给游戏）。翻译中改字体即时生效。";
+  }
+  return "一次性模式下字体是装的时候写进游戏的，改了要重新点一次「开始」并重启游戏。";
+});
+
+/** 只有走 TCP 通道的方式才需要「常驻主机启动脚本」。 */
+const showLauncher = computed(() => service.value === "tcp" && engineKnown.value);
+
 /**
- * 说白了就是「这个引擎点完开始之后，用户该干什么」。两种情况差得远，
- * 与其让用户去猜，不如直接写出来。
+ * 说白了就是「这个模式下点完开始之后，用户该干什么」。三种情况差得远，
+ * 与其让用户去猜，不如直接按后端给的 service 写出来。
  */
 const flow = computed(() => {
   if (!engineKnown.value) {
@@ -41,25 +82,49 @@ const flow = computed(() => {
       note: "",
     };
   }
-  if (needsServer.value) {
+
+  const svc = activeMethod.value?.service;
+  if (!svc) {
+    return {
+      title: "这个模式下没有可用的注入方式",
+      steps: [] as string[],
+      note: "换一个模式试试，或者检查游戏目录是不是填错层了。",
+    };
+  }
+
+  if (svc === "tcp") {
     return {
       title: "点开始后：wtool 要一直开着",
       steps: [
-        "点「开始翻译」——wtool 会装上注入并开始监听。",
-        "启动游戏，正常游玩：剧情、菜单、物品说明都会被翻成中文。",
-        "翻译期间**别关 wtool**（关了桥就断了）。玩完点「停止」。",
+        "点「开始翻译」，wtool 会装上插件并开始监听。",
+        "启动游戏正常游玩，剧情、菜单、物品说明都会被翻成中文。",
+        "翻译期间别关 wtool（关了通道就断），玩完点「停止」。",
       ],
-      note: "不想一直开着这个界面，可以用下面的「生成启动脚本」：双击它就能在后台把主机跑起来，日志落在配置目录。",
+      note: "不想一直开着界面，用下面的「生成启动脚本」在后台跑主机。",
     };
   }
+
+  if (svc === "file_sync") {
+    return {
+      title: "点开始后：wtool 要一直开着（可即时换字体）",
+      steps: [
+        "点「开始翻译」，wtool 会把钩子与词典写进游戏目录。",
+        "启动游戏（这次装完要重启游戏，之后不用再重启）。",
+        "玩的时候在下面换字体，游戏里一秒内跟着变。",
+        "玩完点「停止」；wtool 退出时会还原写进游戏目录的文件。",
+      ],
+      note: "想装完就关掉 wtool，把上面的模式换成「一次性注入」。",
+    };
+  }
+
   return {
     title: "点开始后：装完就能关掉 wtool",
     steps: [
-      "点「安装并完成」——wtool 会把钩子和词典写进游戏目录。",
-      "**这一步做完就可以关掉 wtool 了**，翻译在游戏进程里自己跑，不需要 wtool 陪跑。",
-      "启动游戏即可看到中文。想撤掉翻译时，回到这一页点「取消注入」。",
+      "点「安装并完成」，wtool 会把钩子和词典写进游戏目录。",
+      "这一步做完就可以关掉 wtool，翻译在游戏进程里自己跑。",
+      "启动游戏即可看到中文；想撤掉翻译时回到这一页点「取消注入」。",
     ],
-    note: "这个引擎不需要常驻服务，所以也没有启动脚本 —— 装一次就长期有效。",
+    note: "这个引擎不需要常驻服务，所以也没有启动脚本。",
   };
 });
 
@@ -156,10 +221,22 @@ async function removeLauncher() {
         :filters="[{ name: '词典', extensions: ['json', 'tsv', 'bin', 'txt'] }]"
       >
         <template #hint>
-          MTool 词典只读：能拿来翻译，但 wtool 不会往里写。想改动或换个格式，
-          去「词典与格式」页另存为 wtool 格式。
+          支持 MTool 词典与 wtool 词典，wtool 不会改动源文件。想换格式或导出一份
+          MTool 能读的词典，去「词典与格式」页另存为。
         </template>
       </PathField>
+
+      <div class="field">
+        <label>
+          <span class="name">注入模式</span>
+          <select v-model="config.run_mode">
+            <option v-for="m in MODES" :key="m.value" :value="m.value">
+              {{ m.label }}
+            </option>
+          </select>
+        </label>
+        <p class="hint">{{ modeHint }}</p>
+      </div>
 
       <div class="field">
         <label>
@@ -169,12 +246,8 @@ async function removeLauncher() {
             <option v-for="f in fontOptions" :key="f" :value="f">{{ f }}</option>
           </select>
         </label>
+        <p class="hint">{{ fontHint }}</p>
       </div>
-
-      <p class="hint">
-        字体改动不会立刻生效：需要重新点一次「开始」并重启游戏。不指定时，RGSS3
-        用内置黑体保证中文能画出来，MV/MZ 保持游戏原字体。
-      </p>
     </section>
 
     <!-- 第三步：开始 -->
@@ -199,20 +272,16 @@ async function removeLauncher() {
           :disabled="running || !engineKnown"
           @click="start"
         >
-          {{ needsServer ? "开始翻译" : "安装并完成" }}
+          {{ startLabel }}
         </button>
         <button v-if="running" class="wide" @click="stop">停止</button>
       </div>
 
-      <div v-if="needsServer && engineKnown" class="sub">
+      <div v-if="showLauncher" class="sub">
         <button @click="makeLauncher">生成启动脚本（不想一直开着界面时）</button>
         <button @click="removeLauncher">删除启动脚本</button>
         <p v-if="launcherMsg" class="hint">{{ launcherMsg }}</p>
       </div>
-
-      <p v-if="!engineKnown" class="hint">
-        引擎还没认出来，先把游戏目录填对。
-      </p>
 
       <!-- 开始之后：把「现在该干什么」顶到最显眼的地方 -->
       <div v-if="outcome" class="after" :class="{ live: outcome.server_running }">

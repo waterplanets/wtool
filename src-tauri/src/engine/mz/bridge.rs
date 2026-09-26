@@ -15,7 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::engine::inject::{Mechanism, Report, Reversibility, State};
+use crate::engine::inject::{Mechanism, Mode, Report, Reversibility, Service, State};
 use crate::error::{Error, Result};
 
 /// 桥的源码。编译期直接嵌进二进制。
@@ -23,7 +23,19 @@ use crate::error::{Error, Result};
 /// 不用 `bundle.resources` + 运行时找路径，是因为那样光是「开发时资源在
 /// `target/debug` 里还是在 `resources/` 里」就够折腾了，而这份文件是
 /// 我们自己写的、不需要用户替换，嵌进去最省事。
-const BRIDGE_JS: &str = include_str!("../../../resources/mz_mv/wtool_bridge.js");
+pub(crate) const BRIDGE_JS: &str = include_str!("../../../resources/mz_mv/wtool_bridge.js");
+
+/// 插件源码里那两行「一次性载荷」占位。安装器（`mz::baked`）把它们整行换掉：
+///
+/// - `var WTOOL_BAKED = null;` → 烤入的词典对象字面量；
+/// - `var WTOOL_BAKED_FONT = '';` → 烤入的字体名。
+///
+/// **这两行在源码里必须各出现一次，逐字节一致**（含 4 空格缩进）——替换是纯
+/// 字符串操作，差一个空格就换不中。改插件源码时别顺手格式化它们。
+pub(crate) const BAKED_DICT_LINE: &str = "    var WTOOL_BAKED = null;";
+
+/// 字体那行占位，见 [`BAKED_DICT_LINE`]。
+pub(crate) const BAKED_FONT_LINE: &str = "    var WTOOL_BAKED_FONT = '';";
 
 /// 桥在 `$plugins` 里的注册名。必须和文件名一致，RPG Maker 是按名字找文件的。
 const BRIDGE_NAME: &str = "wtool_bridge";
@@ -31,65 +43,48 @@ const BRIDGE_NAME: &str = "wtool_bridge";
 /// 只负责探测、不负责翻译的那个插件。桥自己会钩同一处，所以装桥时把它关掉。
 const PROBE_NAME: &str = "wtool_reader";
 
-/// 「写 js/plugins」这条注入路。
+/// 一次性模式的烤入载荷（`mz::baked`）写进插件源码后，`WTOOL_BAKED` 那行的开头。
+///
+/// 插件原文里这行是 `var WTOOL_BAKED = null;`，烤入时被整行换成对象字面量，
+/// 于是以 `var WTOOL_BAKED = {` 开头。拿它当「这份文件是我们写的（实时或一次性
+/// 任一）」的判据 —— 两条路写的是同一个文件，卸载时都得认。
+pub(crate) const BAKED_PREFIX: &str = "var WTOOL_BAKED = {";
+
+/// 盘上这份 `wtool_bridge.js` 是不是 wtool 写的（实时源码，或带烤入载荷）。
+fn is_our_file(js: &str) -> bool {
+    js == BRIDGE_JS || js.contains(BAKED_PREFIX)
+}
+
+/// 「写 js/plugins」这条注入路（实时模式）。
 pub struct JsPluginBridge;
 
 impl Mechanism for JsPluginBridge {
     fn id(&self) -> &'static str {
-        "js_plugin"
+        "js_plugin_live"
     }
 
     fn name(&self) -> &'static str {
-        "JS 插件桥（写 js/plugins）"
+        "JS 插件桥（实时，连 wtool）"
+    }
+
+    fn mode(&self) -> Mode {
+        Mode::Live
+    }
+
+    /// 实时这条要靠 wtool 的两个端口活着：主通道 17989 + 同步查表 17990。
+    fn service(&self) -> Service {
+        Service::Tcp
     }
 
     /// 只看磁盘。目录填错、文件没权限都算的一种「探测结果」，不报错。
     fn probe(&self, game_dir: &Path) -> Report {
-        let root = match find_root(game_dir) {
-            Ok(root) => root,
-            Err(e) => {
-                return Report {
-                    state: State::NotApplicable,
-                    detail: e.message,
-                }
-            }
-        };
-
-        let bridge = root.join("js").join("plugins").join("wtool_bridge.js");
-        let list = std::fs::read_to_string(root.join("js").join("plugins.js")).unwrap_or_default();
-        let entry = list.lines().find(|l| is_entry_named(l, BRIDGE_NAME));
-
-        match std::fs::read_to_string(&bridge) {
-            Err(_) => Report {
-                state: State::Ready,
-                detail: "还没装，可以安装".to_string(),
-            },
-            // 注册表里没有，游戏压根不会加载这个文件 —— 和没装一样没用。
-            Ok(_) if entry.is_none() => Report {
-                state: State::Stale,
-                detail: "插件文件在，但 plugins.js 里没打开它，游戏不会加载，需要重装".to_string(),
-            },
-            // `disable_status` 认得出「本来是 true」才会返回 Some；
-            // 返回 None 就说明它现在是关着的。
-            Ok(_) if entry.is_some_and(|l| disable_status(l).is_none()) => Report {
-                state: State::Stale,
-                detail: "插件在，但在 plugins.js 里被关掉了，需要重装".to_string(),
-            },
-            Ok(js) if js != BRIDGE_JS => Report {
-                state: State::Stale,
-                detail: "插件内容不是当前版本，需要重装".to_string(),
-            },
-            Ok(_) => Report {
-                state: State::Installed,
-                detail: "已安装，并在 plugins.js 里打开".to_string(),
-            },
-        }
+        probe_js(game_dir, |js| js == BRIDGE_JS)
     }
 
     /// 词典和字体都不走盘：词典是桥连上后由 wtool 逐条回写，字体是连上后经
     /// 内存通道下发的，所以这两个参数这里都用不上。
     fn install(&self, game_dir: &Path, _dict_path: &Path, _font: &str) -> Result<Vec<String>> {
-        install(game_dir)
+        install_with(game_dir, BRIDGE_JS)
     }
 
     fn uninstall(&self, game_dir: &Path) -> Result<Vec<String>> {
@@ -107,19 +102,70 @@ impl Mechanism for JsPluginBridge {
     }
 }
 
+/// 只看磁盘判断「这条 JS 插件路现在什么状态」。
+///
+/// `current` 判断盘上那份是不是本方式写的当前版本：实时看「和源码逐字节相同」，
+/// 一次性看「带烤入载荷」。两条路写同一个文件，所以探测逻辑共用，见
+/// [`probe`](JsPluginBridge::probe) 与 `mz::baked`。
+pub(crate) fn probe_js(game_dir: &Path, current: impl Fn(&str) -> bool) -> Report {
+    let root = match find_root(game_dir) {
+        Ok(root) => root,
+        Err(e) => {
+            return Report {
+                state: State::NotApplicable,
+                detail: e.message,
+            }
+        }
+    };
+
+    let bridge = root.join("js").join("plugins").join("wtool_bridge.js");
+    let list = std::fs::read_to_string(root.join("js").join("plugins.js")).unwrap_or_default();
+    let entry = list.lines().find(|l| is_entry_named(l, BRIDGE_NAME));
+
+    match std::fs::read_to_string(&bridge) {
+        Err(_) => Report {
+            state: State::Ready,
+            detail: "还没装，可以安装".to_string(),
+        },
+        // 注册表里没有，游戏压根不会加载这个文件 —— 和没装一样没用。
+        Ok(_) if entry.is_none() => Report {
+            state: State::Stale,
+            detail: "插件文件在，但 plugins.js 里没打开它，游戏不会加载，需要重装".to_string(),
+        },
+        // `disable_status` 认得出「本来是 true」才会返回 Some；
+        // 返回 None 就说明它现在是关着的。
+        Ok(_) if entry.is_some_and(|l| disable_status(l).is_none()) => Report {
+            state: State::Stale,
+            detail: "插件在，但在 plugins.js 里被关掉了，需要重装".to_string(),
+        },
+        Ok(js) if !current(&js) => Report {
+            state: State::Stale,
+            detail: "插件内容不是当前版本，需要重装".to_string(),
+        },
+        Ok(_) => Report {
+            state: State::Installed,
+            detail: "已安装，并在 plugins.js 里打开".to_string(),
+        },
+    }
+}
+
 /// 装桥，返回几句给用户看的话。
 ///
+/// `content` 是插件本体的正文：实时模式给 [`BRIDGE_JS`]，一次性模式给烤入词典
+/// 与字体之后的那份（见 `mz::baked`）。两条路除了正文不同，落盘和改
+/// `plugins.js` 的动作完全一样，所以共用这一段。
+///
 /// 游戏目录来自 GUI，用户在别处填错了这里会直接报错，不会瞎写。
-fn install(game_dir: &Path) -> Result<Vec<String>> {
+pub(crate) fn install_with(game_dir: &Path, content: &str) -> Result<Vec<String>> {
     let root = find_root(game_dir)?;
     let mut log = Vec::new();
 
     // ---- 1. 插件本体 ----
     let bridge_path = root.join("js").join("plugins").join("wtool_bridge.js");
-    if std::fs::read_to_string(&bridge_path).ok().as_deref() == Some(BRIDGE_JS) {
+    if std::fs::read_to_string(&bridge_path).ok().as_deref() == Some(content) {
         log.push("wtool_bridge.js 已是最新".to_string());
     } else {
-        write_atomic(&bridge_path, BRIDGE_JS)?;
+        write_atomic(&bridge_path, content)?;
         log.push(format!("已写入 {}", bridge_path.display()));
     }
 
@@ -156,9 +202,9 @@ fn install(game_dir: &Path) -> Result<Vec<String>> {
 ///    都会整个重写 `plugins.js`，用户在装了桥之后自己加过插件是常态。所以只有
 ///    把备份重新装一遍、结果和当前文件逐字节相同（= 这中间只有我们改过），
 ///    才敢整文件还原；否则只撤我们加的那部分。
-/// 3. 插件文件只在内容和我们的源码逐字节相同时才删：用户改过就留着，
-///    那是他的东西，删了不可挽回。
-fn uninstall(game_dir: &Path) -> Result<Vec<String>> {
+/// 3. 插件文件只在「确实是 wtool 写的」时才删（实时源码或带烤入载荷）：
+///    用户改过就留着，那是他的东西，删了不可挽回。
+pub(crate) fn uninstall(game_dir: &Path) -> Result<Vec<String>> {
     let root = find_root(game_dir)?;
     let mut log = Vec::new();
 
@@ -214,7 +260,7 @@ fn uninstall(game_dir: &Path) -> Result<Vec<String>> {
     // ---- 插件文件最后删 ----
     let bridge_path = root.join("js").join("plugins").join("wtool_bridge.js");
     match std::fs::read_to_string(&bridge_path) {
-        Ok(js) if js == BRIDGE_JS => match std::fs::remove_file(&bridge_path) {
+        Ok(js) if is_our_file(&js) => match std::fs::remove_file(&bridge_path) {
             Ok(()) => log.push(format!("已删除 {}", bridge_path.display())),
             // 杀软或者编辑器占着删不掉：不影响游戏，交给用户手动处理。
             Err(e) => log.push(format!(
@@ -226,12 +272,57 @@ fn uninstall(game_dir: &Path) -> Result<Vec<String>> {
         Err(_) => log.push("wtool_bridge.js 本来就不在".to_string()),
     }
 
+    // ---- 顺手清掉桥写下的运行日志 ----
+    // 这些日志是桥在游戏侧自己落的，解铃还须系铃人：用户点「取消注入」意味着
+    // 「把我装的东西都撤走」，留一堆 wtool.log 在游戏目录里不符合这个预期。
+    log.extend(clean_logs(&root));
+
     log.push("游戏如果正开着，要重启才会真的断开".to_string());
     Ok(log)
 }
 
+/// 删掉桥写在游戏目录里的运行日志（`wtool.log` 与轮转的 `wtool.1-4.log`）。
+///
+/// 位置和 `wtool_bridge.js` 里的落盘逻辑一致：优先游戏根目录，退而求其次是
+/// `js/plugins/`（桥找不到可写根目录时会落到插件自己那层）。两处都扫一遍，
+/// 删不掉就记一句、不报错 —— 日志不是游戏资源，删不掉也不影响撤离是否成功。
+fn clean_logs(root: &Path) -> Vec<String> {
+    // `wtool.log` + `wtool.1.log` … `wtool.4.log`，与插件的 `LOG_KEEP = 5` 对应。
+    let names = [
+        "wtool.log",
+        "wtool.1.log",
+        "wtool.2.log",
+        "wtool.3.log",
+        "wtool.4.log",
+    ];
+
+    let mut removed = 0usize;
+    let mut failed = Vec::new();
+    for dir in [root.to_path_buf(), root.join("js").join("plugins")] {
+        for name in names {
+            let path = dir.join(name);
+            if !path.is_file() {
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed += 1,
+                Err(e) => failed.push(format!("{}（{e}）", path.display())),
+            }
+        }
+    }
+
+    let mut log = Vec::new();
+    if removed > 0 {
+        log.push(format!("已清理 {removed} 个 wtool 运行日志"));
+    }
+    for f in failed {
+        log.push(format!("日志没删掉：{f}，可以手动删除"));
+    }
+    log
+}
+
 /// MV 把整个游戏塞在 `www/` 下，MZ 直接铺在根目录，两个都试一遍。
-fn find_root(game_dir: &Path) -> Result<PathBuf> {
+pub(crate) fn find_root(game_dir: &Path) -> Result<PathBuf> {
     for root in [game_dir.to_path_buf(), game_dir.join("www")] {
         if root.join("js").join("plugins").is_dir() {
             return Ok(root);
@@ -424,6 +515,11 @@ fn disable_status(line: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 测试里装的是实时那份源码（`install_with` 的正文参数在这里补上）。
+    fn install(root: &Path) -> Result<Vec<String>> {
+        install_with(root, BRIDGE_JS)
+    }
 
     /// 一次性的游戏目录。项目一贯不新增 crate（连 `link.rs` 都只用 std），
     /// 测试也不为这点事去引 `tempfile`。

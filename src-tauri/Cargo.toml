@@ -1,9 +1,11 @@
 [package]
 name = "wtool"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "RPG Maker 游戏的嵌入式实时翻译工具（MV / MZ / RGSS3）"
+authors = ["wtool contributors"]
 edition = "2021"
+license = "GPL-3.0-or-later"
+readme = "../README.md"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

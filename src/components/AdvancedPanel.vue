@@ -23,6 +23,18 @@ const STATE_TEXT: Record<api.MethodStatus["state"], string> = {
   stale: "需重装",
 };
 
+const MODE_TEXT: Record<api.MethodStatus["mode"], string> = {
+  live: "实时连接",
+  onetime: "一次性注入",
+};
+
+/** 靠什么维持通道 —— 也就是「装完之后用户还得干什么」。 */
+const SERVICE_TEXT: Record<api.MethodStatus["service"], string> = {
+  none: "装完即终态，不用开 wtool",
+  tcp: "翻译时保持 wtool 打开（游戏连上来）",
+  file_sync: "翻译时保持 wtool 打开（改字体即时生效）",
+};
+
 const REVERSE_TEXT: Record<api.MethodStatus["reversible"], string> = {
   runtime_full: "断开即恢复",
   runtime_and_offline: "断开并还原文件",
@@ -102,7 +114,9 @@ async function removeLauncher() {
       </div>
       <p class="muted">
         平常走「翻译」页就够，这里是手动档：单独装、单独撤、看清每种方式往游戏目录
-        写了什么。{{ restartHint }}
+        写了什么。每个引擎有两条路 —— <b>实时连接</b>（调字体用）和
+        <b>一次性注入</b>（正式玩用，装完即终态）。装一条会自动把另一条撤掉，
+        免得在游戏里重叠挂钩。{{ restartHint }}
       </p>
 
       <p v-if="!methods.length" class="hint">
@@ -122,6 +136,7 @@ async function removeLauncher() {
           <tr v-for="m in methods" :key="m.id">
             <td>
               <div class="mname">{{ m.name }}</div>
+              <span class="badge">{{ MODE_TEXT[m.mode] }}</span>
               <span v-if="m.persistent" class="badge ok">持久</span>
               <span v-else class="badge">退出时还原</span>
             </td>
@@ -130,7 +145,7 @@ async function removeLauncher() {
               {{ m.detail }}
               <template v-if="m.state !== 'not_applicable'">
                 <br />撤销：{{ REVERSE_TEXT[m.reversible] }}
-                <br />服务：{{ m.needs_server ? "翻译时要保持 wtool 打开" : "不需要 wtool" }}
+                <br />服务：{{ SERVICE_TEXT[m.service] }}
               </template>
             </td>
             <td class="ops">
@@ -180,8 +195,12 @@ async function removeLauncher() {
         <dt>注入到游戏里的东西</dt>
         <dd>
           <span class="hint">
-            MV/MZ：写在游戏目录的 <code>js/plugins/</code> 下，wtool 退出时自动还原。
-            RGSS3：<code>Patch/</code> 下的钩子与词典，装完长期保留，要撤就在上面点「取消注入」。
+            MV/MZ：游戏目录的 <code>js/plugins/wtool_bridge.js</code>（wtool 退出时还原），
+            运行日志 <code>wtool.log</code> 与轮转的 <code>wtool.1-4.log</code> 也在游戏目录，
+            点「取消注入」会连同插件一起清掉。<br />
+            RGSS3：<code>Patch/</code> 下的钩子、词典与日志
+            （<code>wtool_hook.log</code> / <code>wtool_live.log</code> 等）；
+            点「取消注入」会连同这些日志一起清掉。
           </span>
         </dd>
       </dl>

@@ -164,6 +164,9 @@ pub fn stop_trans() -> bool {
 
 /// 预判这次「开始」会不会起常驻服务。挑不出注入方式就当场报错，
 /// 免得用户对着一个必然失败的任务干等。
+///
+/// 挑法与 `task::run` 完全一致：先按配置 + 引擎定模式，再在那一档里挑第一条
+/// 能用的 —— 否则「预判」和「真跑」会各说各话。
 fn pick_outcome() -> Result<StartOutcome> {
     let cfg = task::config();
     let dir = resolve_game_dir(&cfg.game_dir);
@@ -176,11 +179,13 @@ fn pick_outcome() -> Result<StartOutcome> {
             "这个目录既不像 MZ 也不像 MV，游戏目录是不是填错了？",
         ));
     }
-    let method = inject::pick(kind, &dir).ok_or_else(|| {
+    let mode = inject::resolve_mode(&cfg.run_mode, kind);
+    let method = inject::pick(kind, &dir, mode).ok_or_else(|| {
         Error::new(format!(
-            "{}（{}）上还没有可用的注入方式",
+            "{}（{}）上还没有可用的注入方式（{}模式）",
             kind.name(),
-            kind.runtime().name()
+            kind.runtime().name(),
+            mode.name()
         ))
     })?;
     Ok(StartOutcome {
@@ -227,8 +232,9 @@ pub fn convert_corpus(src: String, dst: String, format: String) -> Result<String
 
 /// 词典「另存为 / 换格式」：读进来按目标格式再写一份。
 ///
-/// 输入可以是 MTool 词典（只读）—— 「把它转成 wtool 能续写的格式」正是
-/// 用户最常需要的一步。输出只可能是能写的两种，[`DictFormat::parse_out`] 保证。
+/// 输入可以是 MTool 词典（扁平 JSON），输出可以是 wtool 的两种格式，也可以是
+/// MTool 同形的扁平 JSON（显式导出，方便把翻好的词典交回 MTool 用）。
+/// [`DictFormat::parse_out`] 把前端的短名翻成具体格式。
 #[tauri::command]
 pub fn convert_dict(src: String, dst: String, format: String) -> Result<String> {
     let src = crate::engine::clean_path(&src);
@@ -267,6 +273,9 @@ pub struct EngineInfo {
     pub runtime: String,
     /// 认出来了没有。`false` 时前端该提示「检查游戏目录」。
     pub known: bool,
+    /// 这个引擎在 `auto` 模式下会走哪条路（`live` / `onetime`）。
+    /// 前端拿它当模式选择器「自动（推荐）」那一档的实际值。
+    pub default_mode: String,
 }
 
 /// 引擎探测结果，给界面显示。
@@ -277,6 +286,8 @@ pub fn detect_engine(game_dir: &str) -> EngineInfo {
         name: kind.name().to_string(),
         runtime: kind.runtime().name().to_string(),
         known: kind != EngineType::Unknown,
+        // `auto` 解析出来的那个模式：MV/MZ → live，RGSS3 → onetime。
+        default_mode: inject::resolve_mode("auto", kind).as_str().to_string(),
     }
 }
 
@@ -305,9 +316,18 @@ pub fn install_injection(
 ) -> Result<Vec<String>> {
     remember_game_dir(game_dir);
     let dir = resolve_game_dir(game_dir);
-    let method = inject::find(get_engine_type(&dir), id)
+    let kind = get_engine_type(&dir);
+    let method = inject::find(kind, id)
         .ok_or_else(|| Error::new(format!("这个游戏上没有叫「{id}」的注入方式")))?;
-    method.install(&dir, Path::new(&crate::engine::clean_path(dict_path)), font)
+    // 两套路子在同一引擎上会重叠挂钩，装之前先把另一条卸掉（正常走
+    // `start_translation` 时也会做，这里是给单独安装的口子补上）。
+    let mut log = inject::uninstall_siblings(kind, &dir, method.id());
+    log.extend(method.install(
+        &dir,
+        Path::new(&crate::engine::clean_path(dict_path)),
+        font,
+    )?);
+    Ok(log)
 }
 
 /// 撤销某个注入方式，把游戏目录恢复原样。

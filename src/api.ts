@@ -16,13 +16,15 @@ export interface AppConfig {
   game_dir: string;
   dict_path: string;
   font: string;
+  /** 注入模式：`auto`（各引擎自己成熟的那条）/ `live`（实时连接）/ `onetime`（一次性注入）。 */
+  run_mode: string;
   /** `gtx`（Google，免费零配置）或 `llm`（OpenAI 兼容）。 */
   translate_backend: string;
   corpus_path: string;
   out_path: string;
   /** 语料输出格式：`tsv` 或 `json`。 */
   corpus_format: string;
-  /** 词典输出格式：`tsv` 或 `json`。 */
+  /** 词典输出格式：`tsv` / `json`（wtool JSON）/ `mtool`（扁平 JSON）。 */
   dict_format: string;
   llm_base_url: string;
   llm_model: string;
@@ -34,6 +36,10 @@ export interface AppConfig {
 export interface MethodStatus {
   id: string;
   name: string;
+  /** 实时 / 一次性。 */
+  mode: "live" | "onetime";
+  /** 靠什么维持通道：`none` = 装完即终态。 */
+  service: "none" | "tcp" | "file_sync";
   state: "not_applicable" | "ready" | "installed" | "stale";
   detail: string;
   reversible:
@@ -53,6 +59,8 @@ export interface EngineInfo {
   name: string;
   runtime: string;
   known: boolean;
+  /** 这个引擎在 `auto` 模式下会走哪条路（`live` / `onetime`）。 */
+  default_mode: "live" | "onetime";
 }
 
 /** 与 Rust 侧 `commands::StartOutcome` 一一对应。 */
@@ -75,6 +83,7 @@ export function emptyConfig(): AppConfig {
     game_dir: "",
     dict_path: "",
     font: "",
+    run_mode: "auto",
     translate_backend: "gtx",
     corpus_path: "",
     out_path: "",
@@ -122,7 +131,7 @@ export const collectOffline = (gameDir: string, out: string, format: string) =>
 export const convertCorpus = (src: string, dst: string, format: string) =>
   invoke<string>("convert_corpus", { src, dst, format });
 
-/** 词典另存为 / 换格式（输入可以是只读的 MTool 词典）。 */
+/** 词典另存为 / 换格式（输入可以是 MTool 词典，输出也可选 MTool 兼容格式）。 */
 export const convertDict = (src: string, dst: string, format: string) =>
   invoke<string>("convert_dict", { src, dst, format });
 

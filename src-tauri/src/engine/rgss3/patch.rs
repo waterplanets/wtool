@@ -3,10 +3,19 @@
 //! VX Ace 的 `Game.exe` 启动时会 `File.read("Patch/Patch.rb")` 再 `eval` 它
 //! （NWPatch 机制）。这条路不动进程内存、不落 DLL，杀软管不着，删文件即撤销。
 //!
+//! 本模块同时是 RGSS3 两条注入路的**共用底座**：
+//!
+//! - [`Rgss3Patch`]（一次性）：把词典烤成 TSV、把字体烤进钩子源码，装完即终态；
+//! - [`super::live`]（实时）：同一份钩子源码，但 `LIVE=true`，路径指向另一组
+//!   文件，钩子每秒比一次 mtime 热重载 —— 换字体不用重装。
+//!
+//! 两条路的差别只在「钩子源码里那几行配置」和「写到哪些文件」，其余（找目录、
+//! 转 TSV、追加 loader、重算认证号、就地摘除）完全一样，所以都放在这里。
+//!
 //! 干三件事：
 //!
-//! 1. 把 GUI 配的词典转成游戏侧能直接读的 TSV（`Patch/wtool_dict.tsv`）——
-//!    RGSS3 是 Ruby 1.9.2、没有 `json`，所以不能直接喂 MTool 的 JSON；
+//! 1. 把 GUI 配的词典转成游戏侧能直接读的 TSV —— RGSS3 是 Ruby 1.9.2、
+//!    没有 `json`，所以不能直接喂 MTool 的 JSON；
 //! 2. 把嵌进来的钩子写进 `Patch/wtool_hook.rb`；
 //! 3. 在 `Patch/Patch.rb` 末尾追加一段 loader，并**重算第 1 行的认证号** ——
 //!    NWPatch 会校验它，算错游戏直接 raise 不启动。
@@ -22,34 +31,70 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::dict;
-use crate::engine::inject::{Mechanism, Report, Reversibility, State};
+use crate::engine::inject::{Mechanism, Mode, Report, Reversibility, Service, State};
 use crate::error::{Error, Result};
 
 /// 钩子源码。编译期直接嵌进二进制（和 MZ 的桥同一个理由：这份文件是我们
 /// 自己写的、不需要用户替换，嵌进来省掉运行时找路径的一堆事）。
-const HOOK_RB: &str = include_str!("../../../resources/rgss3/wtool_hook.rb");
+pub(crate) const HOOK_RB: &str = include_str!("../../../resources/rgss3/wtool_hook.rb");
 
-/// loader 段的起始标记。装/卸都按它定位，改认证号时不碰别的。
+/// 一次性那条的 loader 起始标记。装/卸都按它定位，改认证号时不碰别的。
+/// 实时那条用 [`super::live`] 里的另一个标记，两条互不干扰。
 const MARKER: &str = "# ---- wtool RGSS3 hook loader (auto-generated) ----";
 
-/// 钩子里那行字体常量（默认值）。用户在界面上选了别的字体就把整行换掉。
-///
-/// 为什么烤文件而不是像 MZ 那样运行时下发：RGSS3 这条路的代码是游戏启动时
-/// 从盘上 `eval` 的，wtool 和游戏之间没有连接通道，改字体只能改文件。
+// ---- 钩子源码里「安装器可控」的那几行 --------------------------------------
+//
+// 安装时按模式整行替换，所以**字面形状**（等号两边的对齐空格）必须和
+// `resources/rgss3/wtool_hook.rb` 里逐字节一致。改一处必须同步改另一处。
+//
+// 为什么字体烤文件而不是像 MZ 那样运行时下发：RGSS3 这条路的代码是游戏启动
+// 时从盘上 `eval` 的，wtool 和游戏之间没有连接通道，改字体只能改文件。
+// （实时那条就是靠「改文件 + 钩子轮询」把这件事做成热更新的。）
+
+/// `LIVE      = false` —— 实数模式开关。
+const LIVE_LINE: &str = "LIVE      = false";
+/// `DICT_PATH = "Patch/wtool_dict.tsv"`。
+const DICT_LINE: &str = "DICT_PATH = \"Patch/wtool_dict.tsv\"";
+/// `LOG_PATH  = "Patch/wtool_hook.log"`。
+const LOG_LINE: &str = "LOG_PATH  = \"Patch/wtool_hook.log\"";
+/// `MISS_PATH = "Patch/wtool_miss.log"`。
+const MISS_LINE: &str = "MISS_PATH = \"Patch/wtool_miss.log\"";
+/// `ERR_PATH  = "Patch/wtool_hook.err"`。
+const ERR_LINE: &str = "ERR_PATH  = \"Patch/wtool_hook.err\"";
+/// `FONT_PATH = ""` —— 实时模式下 wtool 把字体名写进这个文件，钩子轮询热更新。
+const FONT_PATH_LINE: &str = "FONT_PATH = \"\"";
+/// `FONT_NAME = "黑体"` —— 烤进源码的默认字体（也是字体文件的回退值）。
 const FONT_LINE: &str = "FONT_NAME = \"黑体\"";
+
+/// 版本比对时要抹平的全部配置行。字体、路径都是「用户/模式选的」，不该让
+/// 「盘上这份钩子是不是当前版本」的判定跟着它们变（否则换个字体就报「需重装」）。
+const CONFIG_KEYS: [&str; 7] = [
+    "LIVE",
+    "DICT_PATH",
+    "LOG_PATH",
+    "MISS_PATH",
+    "ERR_PATH",
+    "FONT_PATH",
+    "FONT_NAME",
+];
 
 /// 追加到 `Patch.rb` 末尾的 loader。纯 ASCII，不放日文 —— 认证号是按字面
 /// 内容算的，写起来越简单越不容易算错。
-const LOADER: &str = r##"
-# ---- wtool RGSS3 hook loader (auto-generated) ----
-if File.exist?("Patch/wtool_hook.rb")
+///
+/// 参数化是因为两条路各有自己的钩子文件与错误文件：一次性是
+/// `wtool_hook.rb` / `wtool_hook.err`，实时是 `wtool_live.rb` / `wtool_live.err`。
+pub(crate) fn build_loader(marker: &str, rb: &str, err: &str) -> String {
+    format!(
+        r##"
+{marker}
+if File.exist?("{rb}")
   begin
-    _wt_src = File.open("Patch/wtool_hook.rb", "r:utf-8") { |_wt_f| _wt_f.read }
-    eval(_wt_src, TOPLEVEL_BINDING, "Patch/wtool_hook.rb")
+    _wt_src = File.open("{rb}", "r:utf-8") {{ |_wt_f| _wt_f.read }}
+    eval(_wt_src, TOPLEVEL_BINDING, "{rb}")
   rescue Exception => _wt_e
     begin
-      File.open("Patch/wtool_hook.err", "w:utf-8") do |_wt_f|
-        _wt_f.puts("#{_wt_e.class}: #{_wt_e.message}")
+      File.open("{err}", "w:utf-8") do |_wt_f|
+        _wt_f.puts("#{{_wt_e.class}}: #{{_wt_e.message}}")
         _wt_f.puts(_wt_e.backtrace)
       end
     rescue Exception
@@ -57,9 +102,16 @@ if File.exist?("Patch/wtool_hook.rb")
   end
 end
 # ---- wtool end ----
-"##;
+"##
+    )
+}
 
-/// 「写 Patch.rb」这条注入路。
+/// 一次性那条的 loader（游戏目录里的文件名固定）。
+fn loader() -> String {
+    build_loader(MARKER, "Patch/wtool_hook.rb", "Patch/wtool_hook.err")
+}
+
+/// 「写 Patch.rb」这条注入路（一次性：词典与字体都烤进游戏目录）。
 pub struct Rgss3Patch;
 
 impl Mechanism for Rgss3Patch {
@@ -68,7 +120,16 @@ impl Mechanism for Rgss3Patch {
     }
 
     fn name(&self) -> &'static str {
-        "RGSS3 Patch.rb（零注入）"
+        "RGSS3 Patch.rb（一次性，词典烤入）"
+    }
+
+    fn mode(&self) -> Mode {
+        Mode::OneTime
+    }
+
+    /// 词典烤在钩子旁边、游戏自己查表，不需要 wtool 起任何服务。
+    fn service(&self) -> Service {
+        Service::None
     }
 
     /// 只看磁盘。找不到 `Patch/Patch.rb` 就是「这条路在这游戏上不成立」。
@@ -87,9 +148,9 @@ impl Mechanism for Rgss3Patch {
                 state: State::Ready,
                 detail: "还没装，可以安装".to_string(),
             },
-            // 比的是「去掉字体那行之后」的内容：字体是用户选的，不该影响
-            // 「这份钩子是不是当前版本」的判断（否则换个字体就报「需重装」）。
-            Ok(rb) if strip_font_line(&rb) != strip_font_line(HOOK_RB) => Report {
+            // 比的是「去掉全部配置行之后」的内容：字体、路径都是用户/模式选的，
+            // 不该影响「这份钩子是不是当前版本」的判断（否则换个字体就报「需重装」）。
+            Ok(rb) if strip_config_lines(&rb) != strip_config_lines(HOOK_RB) => Report {
                 state: State::Stale,
                 detail: "钩子不是当前版本，需要重装".to_string(),
             },
@@ -134,11 +195,6 @@ impl Mechanism for Rgss3Patch {
         true
     }
 
-    /// 钩子自带词典、在游戏进程内查表，**不需要 wtool 起任何服务**。
-    fn needs_server(&self) -> bool {
-        false
-    }
-
     /// 装完就留在游戏目录：wtool 退出时不还原，游戏照常翻译。
     fn persistent(&self) -> bool {
         true
@@ -173,7 +229,7 @@ fn install(game_dir: &Path, dict_path: &Path, font: &str) -> Result<Vec<String>>
     ));
 
     // ---- 2. 钩子本体（用户选的字体烤进 FONT_NAME 那行）----
-    let hook_src = build_hook(font);
+    let hook_src = build_hook(&HookConfig::onetime(font))?;
     let hook = dir.join("wtool_hook.rb");
     if std::fs::read_to_string(&hook).ok().as_deref() == Some(hook_src.as_str()) {
         log.push("wtool_hook.rb 已是最新".to_string());
@@ -186,6 +242,150 @@ fn install(game_dir: &Path, dict_path: &Path, font: &str) -> Result<Vec<String>>
     }
 
     // ---- 3. Patch.rb：备份 + 追加 loader + 重算认证号 ----
+    attach_loader(&dir, MARKER, &loader(), &mut log)?;
+    log.push("游戏如果已经开着，要重启才会加载钩子".to_string());
+
+    Ok(log)
+}
+
+/// 卸钩子，返回几句给用户看的话。
+fn uninstall(game_dir: &Path) -> Result<Vec<String>> {
+    let dir = find_patch_dir(game_dir)?;
+    let mut log = Vec::new();
+
+    detach_or_restore(&dir, MARKER, &mut log)?;
+
+    // 钩子/词典/日志/错误文件/未命中记录一起清。日志可能被正跑着的游戏占着，
+    // 删不掉不影响游戏，交给用户手动处理。
+    for name in [
+        "wtool_hook.rb",
+        "wtool_dict.tsv",
+        "wtool_hook.log",
+        "wtool_hook.err",
+        "wtool_miss.log",
+    ] {
+        remove_file_logged(&dir.join(name), &mut log);
+    }
+
+    log.push("游戏如果正开着，要重启才会真的断开".to_string());
+    Ok(log)
+}
+
+/// 删一个文件并记一行日志；文件本就不在就跳过。删不掉不报错（游戏可能正占着）。
+pub(crate) fn remove_file_logged(p: &Path, log: &mut Vec<String>) {
+    if !p.exists() {
+        return;
+    }
+    match std::fs::remove_file(p) {
+        Ok(()) => log.push(format!("已删除 {}", p.display())),
+        Err(e) => log.push(format!("删不掉 {}（{e}），不影响游戏，可手动删除", p.display())),
+    }
+}
+
+/// RGSS3 的 `Patch/` 只在游戏根目录，不试 `www/`（那是 MV 的封装）。
+pub(crate) fn find_patch_dir(game_dir: &Path) -> Result<PathBuf> {
+    let dir = game_dir.join("Patch");
+    if dir.join("Patch.rb").is_file() {
+        return Ok(dir);
+    }
+    Err(Error::new(format!(
+        "{} 里找不到 Patch/Patch.rb，这不是一个用 NWPatch 的 RGSS3 游戏，或者游戏目录填错了？",
+        game_dir.display()
+    )))
+}
+
+/// 装钩子时要改写的那几行配置。两条路（一次性 / 实时）只是取值不同。
+pub(crate) struct HookConfig {
+    pub live: bool,
+    pub dict: String,
+    pub log: String,
+    pub miss: String,
+    pub err: String,
+    pub font_path: String,
+    pub font_name: String,
+}
+
+impl HookConfig {
+    /// 一次性：路径就用钩子源码里那几条既有值，字体烤进 `FONT_NAME`。
+    pub fn onetime(font: &str) -> Self {
+        Self {
+            live: false,
+            dict: "Patch/wtool_dict.tsv".to_string(),
+            log: "Patch/wtool_hook.log".to_string(),
+            miss: "Patch/wtool_miss.log".to_string(),
+            err: "Patch/wtool_hook.err".to_string(),
+            font_path: String::new(),
+            font_name: font.trim().to_string(),
+        }
+    }
+}
+
+/// 把配置写进钩子源码，得到实际落盘的那份。
+///
+/// 每个配置行都按**精确子串**替换一次；找不到就报错，而不是悄悄装一份配置不对的
+/// 钩子 —— 那会让游戏加载到错误路径、翻不出来还查不出原因。
+pub(crate) fn build_hook(cfg: &HookConfig) -> Result<String> {
+    let mut src = HOOK_RB.to_string();
+    if cfg.live {
+        src = subs(&src, LIVE_LINE, "LIVE      = true")?;
+    }
+    src = subs(&src, DICT_LINE, &format!("DICT_PATH = \"{}\"", ruby_str(&cfg.dict)))?;
+    src = subs(&src, LOG_LINE, &format!("LOG_PATH  = \"{}\"", ruby_str(&cfg.log)))?;
+    src = subs(&src, MISS_LINE, &format!("MISS_PATH = \"{}\"", ruby_str(&cfg.miss)))?;
+    src = subs(&src, ERR_LINE, &format!("ERR_PATH  = \"{}\"", ruby_str(&cfg.err)))?;
+    src = subs(&src, FONT_PATH_LINE, &format!("FONT_PATH = \"{}\"", ruby_str(&cfg.font_path)))?;
+    if !cfg.font_name.is_empty() {
+        src = subs(
+            &src,
+            FONT_LINE,
+            &format!("FONT_NAME = \"{}\"", ruby_str(&cfg.font_name)),
+        )?;
+    }
+    Ok(src)
+}
+
+/// 在 `src` 里把 `from` 整个换成 `to`（只换第一处）。找不到就是源码和常量不同步。
+fn subs(src: &str, from: &str, to: &str) -> Result<String> {
+    if !src.contains(from) {
+        return Err(Error::new(format!(
+            "钩子源码里找不到配置行「{from}」—— resources/rgss3/wtool_hook.rb 和 Rust 侧常量不同步了"
+        )));
+    }
+    Ok(src.replacen(from, to, 1))
+}
+
+/// 写进 Ruby 双引号字符串前转义。路径/字体名都是能手打的，不转义能把整份
+/// Ruby 拆坏、游戏起不来。
+pub(crate) fn ruby_str(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// 比对「盘上这份钩子是不是当前版本」之前，先把全部安装器可控的配置行抹成
+/// 固定形状 —— 字体、路径、模式都是用户/模式选的，不该让版本判定跟着它们变。
+pub(crate) fn strip_config_lines(src: &str) -> String {
+    src.lines()
+        .map(|l| {
+            let t = l.trim_start();
+            match CONFIG_KEYS.iter().find(|k| {
+                t.strip_prefix(**k)
+                    .map(|rest| rest.trim_start().starts_with('='))
+                    .unwrap_or(false)
+            }) {
+                Some(k) => format!("{k} = ?"),
+                None => l.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 把 loader 段追加到 `Patch.rb` 末尾（已在就只重算认证号），并留一份原文件备份。
+pub(crate) fn attach_loader(
+    dir: &Path,
+    marker: &str,
+    loader: &str,
+    log: &mut Vec<String>,
+) -> Result<()> {
     let rb = dir.join("Patch.rb");
     let src = read_utf8(&rb)?;
 
@@ -196,7 +396,7 @@ fn install(game_dir: &Path, dict_path: &Path, font: &str) -> Result<Vec<String>>
         log.push(format!("原 Patch.rb 已备份到 {}", bak.display()));
     }
 
-    let appended = if src.contains(MARKER) {
+    let appended = if src.contains(marker) {
         log.push("Patch.rb：loader 已在，只重算认证号".to_string());
         src.clone()
     } else {
@@ -204,7 +404,7 @@ fn install(game_dir: &Path, dict_path: &Path, font: &str) -> Result<Vec<String>>
         if !s.ends_with('\n') {
             s.push('\n');
         }
-        s.push_str(LOADER);
+        s.push_str(loader);
         log.push("Patch.rb：已追加 loader".to_string());
         s
     };
@@ -214,19 +414,13 @@ fn install(game_dir: &Path, dict_path: &Path, font: &str) -> Result<Vec<String>>
         write_atomic(&rb, &out)?;
     }
     log.push(format!("Patch.rb 认证号 → # {tp}"));
-    log.push("游戏如果已经开着，要重启才会加载钩子".to_string());
-
-    Ok(log)
+    Ok(())
 }
 
-/// 卸钩子，返回几句给用户看的话。
-///
-/// 有备份就整文件还原（认证号随之回到原值）；没有就**就地**把 loader 段摘掉
-/// 再重算认证号 —— 用户自己改过 `Patch.rb` 时只能这么办，不能拿旧备份覆盖。
-fn uninstall(game_dir: &Path) -> Result<Vec<String>> {
-    let dir = find_patch_dir(game_dir)?;
-    let mut log = Vec::new();
-
+/// 把 loader 段从 `Patch.rb` 摘掉：有备份就整文件还原（认证号随之回到原值）；
+/// 没有就**就地**摘除再重算认证号 —— 用户自己改过 `Patch.rb` 时只能这么办，
+/// 不能拿旧备份覆盖。
+pub(crate) fn detach_or_restore(dir: &Path, marker: &str, log: &mut Vec<String>) -> Result<()> {
     let rb = dir.join("Patch.rb");
     let bak = dir.join("Patch.rb.wtool-bak");
 
@@ -237,7 +431,7 @@ fn uninstall(game_dir: &Path) -> Result<Vec<String>> {
         log.push("Patch.rb 已还原到备份（认证号回到原值）".to_string());
     } else if rb.exists() {
         let text = read_utf8(&rb)?;
-        if let Some(at) = text.find(MARKER) {
+        if let Some(at) = text.find(marker) {
             // loader 是我们追加的：前面会多出一个空行，一并去掉，
             // 让摘完的正文和当初逐字节一致（和 Python 版同一套处理）。
             let head = format!("{}\n", text[..at].trim_end_matches('\n'));
@@ -250,76 +444,13 @@ fn uninstall(game_dir: &Path) -> Result<Vec<String>> {
     } else {
         log.push("Patch.rb 不存在，跳过".to_string());
     }
-
-    // 钩子/词典/日志/错误文件/未命中记录一起清。日志可能被正跑着的游戏占着，
-    // 删不掉不影响游戏，交给用户手动处理。
-    for name in [
-        "wtool_hook.rb",
-        "wtool_dict.tsv",
-        "wtool_hook.log",
-        "wtool_hook.err",
-        "wtool_miss.log",
-    ] {
-        let p = dir.join(name);
-        if !p.exists() {
-            continue;
-        }
-        match std::fs::remove_file(&p) {
-            Ok(()) => log.push(format!("已删除 {}", p.display())),
-            Err(e) => log.push(format!("删不掉 {}（{e}），不影响游戏，可手动删除", p.display())),
-        }
-    }
-
-    log.push("游戏如果正开着，要重启才会真的断开".to_string());
-    Ok(log)
-}
-
-/// RGSS3 的 `Patch/` 只在游戏根目录，不试 `www/`（那是 MV 的封装）。
-fn find_patch_dir(game_dir: &Path) -> Result<PathBuf> {
-    let dir = game_dir.join("Patch");
-    if dir.join("Patch.rb").is_file() {
-        return Ok(dir);
-    }
-    Err(Error::new(format!(
-        "{} 里找不到 Patch/Patch.rb，这不是一个用 NWPatch 的 RGSS3 游戏，或者游戏目录填错了？",
-        game_dir.display()
-    )))
-}
-
-/// 把用户选的字体写进钩子源码的 `FONT_NAME` 那行。
-///
-/// 空串 = 不动，用钩子自带的那条默认字体。名字里的引号和反斜杠要转义 ——
-/// 界面上那个名字是能手打的，不转义就能把整份 Ruby 拆坏、游戏起不来。
-fn build_hook(font: &str) -> String {
-    let font = font.trim();
-    if font.is_empty() {
-        return HOOK_RB.to_string();
-    }
-    let escaped = font.replace('\\', "\\\\").replace('"', "\\\"");
-    HOOK_RB.replace(FONT_LINE, &format!("FONT_NAME = \"{escaped}\""))
-}
-
-/// 比对「盘上这份钩子是不是当前版本」之前，先把字体那行抹成固定形状。
-///
-/// 字体是用户选的，不该让版本比对跟着它变 —— 否则换个字体就被判成「需重装」，
-/// 而用户其实什么都没坏。
-fn strip_font_line(src: &str) -> String {
-    src.lines()
-        .map(|l| {
-            if l.trim_start().starts_with("FONT_NAME") {
-                "FONT_NAME = ?"
-            } else {
-                l
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    Ok(())
 }
 
 /// 读文件按 UTF-8，读不出来给一句能看懂的话。
 ///
 /// `Patch.rb` 实测是 UTF-8；不是的话**拒绝改写** —— 改坏了游戏起不来。
-fn read_utf8(path: &Path) -> Result<String> {
+pub(crate) fn read_utf8(path: &Path) -> Result<String> {
     std::fs::read_to_string(path).map_err(|e| {
         Error::new(format!(
             "读不了 {}（{e}）—— 这个文件必须是 UTF-8，拒绝改写以免游戏起不来",
@@ -329,12 +460,12 @@ fn read_utf8(path: &Path) -> Result<String> {
 }
 
 /// 词典统计，装完报一行给用户看。
-struct DictStats {
-    kept: usize,
-    ascii: usize,
-    short: usize,
-    empty: usize,
-    ctl: usize,
+pub(crate) struct DictStats {
+    pub kept: usize,
+    pub ascii: usize,
+    pub short: usize,
+    pub empty: usize,
+    pub ctl: usize,
 }
 
 /// 把词典转成 TSV 正文（UTF-8，每行「原文<TAB>译文」，`#` 开头是注释）。
@@ -345,7 +476,7 @@ struct DictStats {
 /// - **单字 key**：`lookup` 的长度守卫挡掉（单字查表正是文本错位的成因）；
 /// - **空译文**：没有意义；
 /// - **含真换行/制表的条目**：没法规整地塞进行式 TSV，留着会撑破格式。
-fn build_tsv(map: &BTreeMap<String, String>, src: &Path) -> (String, DictStats) {
+pub(crate) fn build_tsv(map: &BTreeMap<String, String>, src: &Path) -> (String, DictStats) {
     let mut stats = DictStats {
         kept: 0,
         ascii: 0,
@@ -453,7 +584,7 @@ fn is_ascii_digit_or_ws(c: char) -> bool {
 }
 
 /// 先写同目录的 `.tmp` 再 rename（理由同 MZ 桥：改坏 `Patch.rb` 游戏起不来）。
-fn write_atomic(path: &Path, content: &str) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, content: &str) -> Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".wtool.tmp");
     let tmp = PathBuf::from(tmp);

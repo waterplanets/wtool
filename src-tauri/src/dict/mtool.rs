@@ -283,3 +283,23 @@ pub fn load_index(path: &Path) -> Result<BTreeMap<String, String>> {
     let raw = crate::dict::format::read_text(path)?;
     Ok(serde_json::from_str(&raw)?)
 }
+
+/// 写一份跟 MTool `TrsData.json` 同形的词典：一个扁平的 `{"原文": "译文"}` 对象。
+///
+/// 这是**显式选择**的产物 —— 用户要的是「能被 MTool 读回去的词典」，例如
+/// 让 MTool 接着把没翻完的部分跑完。wtool 不会拿它当默认输出格式，也不会
+/// 在别处偷偷写它：只有用户在「输出格式」里选了 MTool，才会落到这儿。
+///
+/// 空 key、空译文（= 未翻译）不写出去，跟 wtool 自身格式的约定一致；
+/// `BTreeMap` 保证输出有序，同一份词典写两次逐字节相同。
+pub fn write_index(path: &Path, map: &BTreeMap<String, String>) -> Result<usize> {
+    let kept: BTreeMap<&str, &str> = map
+        .iter()
+        .filter(|(k, v)| !k.is_empty() && !v.is_empty())
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let n = kept.len();
+
+    std::fs::write(path, serde_json::to_string(&kept)?)?;
+    Ok(n)
+}
